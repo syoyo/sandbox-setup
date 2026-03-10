@@ -38,7 +38,14 @@ PROXY_SCRIPT="$SCRIPT_DIR/credential-proxy.js"
 # ---------------------------------------------------------------------------
 # HIGH-2/MED-3: use XDG_RUNTIME_DIR (user-private, tmpfs on systemd) to avoid
 # world-readable sockets in /tmp and TOCTOU races.
-_SOCK_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+# HIGH-4 fix: if XDG_RUNTIME_DIR is unset, create a private temp directory.
+if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+  _SOCK_DIR="$XDG_RUNTIME_DIR"
+else
+  _SOCK_DIR=$(mktemp -d /tmp/claudebox-XXXXXX)
+  chmod 700 "$_SOCK_DIR"
+  _SOCK_DIR_CREATED=true
+fi
 SOCKET_ANTHROPIC="$_SOCK_DIR/claude-proxy-anthropic-$$.sock"
 SOCKET_GITHUB="$_SOCK_DIR/claude-proxy-github-$$.sock"
 SOCKET_MCP="$_SOCK_DIR/claude-proxy-mcp-$$.sock"
@@ -100,7 +107,10 @@ while [[ $# -gt 0 ]]; do
       IDLE_TIMEOUT=$2; shift 2 ;;
     --attach)  ATTACH_MODE=true; shift ;;
     --notify-command)  NOTIFY_COMMAND=$2; shift 2 ;;
-    --notify-webhook)  NOTIFY_WEBHOOK=$2; shift 2 ;;
+    --notify-webhook)
+      # MED-1: only allow https webhooks to prevent SSRF to internal services.
+      [[ "$2" =~ ^https:// ]] || { echo "❌ --notify-webhook: only https:// URLs allowed"; exit 1; }
+      NOTIFY_WEBHOOK=$2; shift 2 ;;
     --anthropic-port)
       [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1024 && $2 <= 65535 )) || { echo "❌ --anthropic-port: invalid port '$2' (1024-65535)"; exit 1; }
       PORT_ANTHROPIC=$2; shift 2 ;;
@@ -219,6 +229,8 @@ cleanup() {
   rm -f "$SOCKET_ANTHROPIC" "$SOCKET_GITHUB" "$SOCKET_MCP" 2>/dev/null || true
   rm -rf "$ATTACH_DIR" 2>/dev/null || true
   [[ -n "$TEMP_CREDS" && -f "$TEMP_CREDS" && -z "$DUMMY_CREDS_FILE" ]] && rm -f "$TEMP_CREDS" || true
+  # HIGH-4: clean up private temp dir if we created it
+  [[ "${_SOCK_DIR_CREATED:-}" == true ]] && rm -rf "$_SOCK_DIR" 2>/dev/null || true
   exit $code
 }
 trap cleanup INT TERM EXIT
@@ -314,7 +326,9 @@ if [[ "$ENABLE_GITHUB_MCP" == true ]]; then
   done
   (echo >/dev/tcp/127.0.0.1/"$PORT_MCP") 2>/dev/null || { echo "❌ GitHub MCP server did not start"; exit 1; }
   echo "✔ GitHub MCP server ready (port $PORT_MCP)"
-  PROXY_ARGS+=(--mcp-bridge-socket "$SOCKET_MCP" --mcp-bridge-port "$PORT_MCP" --mcp-bearer-token "$GH_TOKEN")
+  # HIGH-3: pass bearer token via env var, not CLI arg (avoids /proc/PID/cmdline leak).
+  export MCP_BEARER_TOKEN="$GH_TOKEN"
+  PROXY_ARGS+=(--mcp-bridge-socket "$SOCKET_MCP" --mcp-bridge-port "$PORT_MCP")
 fi
 [[ "$IDLE_TIMEOUT" -gt 0 ]] && PROXY_ARGS+=(--idle-timeout "$IDLE_TIMEOUT")
 [[ -n "$NOTIFY_COMMAND" ]] && PROXY_ARGS+=(--notify-command "$NOTIFY_COMMAND")
@@ -345,6 +359,9 @@ echo "✔ Proxy ready (anthropic=$SOCKET_ANTHROPIC, github=$SOCKET_GITHUB, allow
 # Resolve dummy credentials file
 # ---------------------------------------------------------------------------
 if [[ -n "$DUMMY_CREDS_FILE" ]]; then
+  # MED-3: canonicalize to prevent symlink-based file leaks into sandbox.
+  DUMMY_CREDS_FILE=$(realpath --canonicalize-existing "$DUMMY_CREDS_FILE" 2>/dev/null) || {
+    echo "❌ --dummy-credentials: file not found: $DUMMY_CREDS_FILE"; exit 1; }
   [[ -f "$DUMMY_CREDS_FILE" ]] || { echo "❌ --dummy-credentials: file not found: $DUMMY_CREDS_FILE"; exit 1; }
   node -e "JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'))" "$DUMMY_CREDS_FILE" \
     2>/dev/null || { echo "❌ --dummy-credentials: not valid JSON: $DUMMY_CREDS_FILE"; exit 1; }
@@ -643,7 +660,7 @@ SANDBOX_INIT_SCRIPT='
 
   # MED-6: --no-dereference prevents symlinks in the seed dir from leaking host files.
   if [[ -d /run/sandbox-home-seed ]]; then
-    cp --no-dereference -rT /run/sandbox-home-seed "$HOME"
+    cp --no-dereference --no-preserve=mode,ownership -rT /run/sandbox-home-seed "$HOME"
   fi
 
   printf '\''{"hasCompletedOnboarding": true, "installMethod": "native"}'\'' > "$HOME/.claude.json"

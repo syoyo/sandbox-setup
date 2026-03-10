@@ -58,6 +58,12 @@ const GITHUB_ALLOWLIST = ['api.github.com'];
 // MED-5: maximum request body size (bytes) to prevent host OOM via proxy.
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB
 
+// Maximum concurrent connections per server (MED-4: prevent FD exhaustion).
+const MAX_CONNECTIONS = 100;
+
+// MCP proxy path allowlist — only /mcp and /sse endpoints.
+const MCP_PATH_ALLOWLIST = /^\/(mcp|sse)(\/|$)/;
+
 // ---------------------------------------------------------------------------
 // Argument parsing
 // ---------------------------------------------------------------------------
@@ -74,7 +80,7 @@ function parseArgs(argv) {
     notifyWebhook:     null,
     mcpBridgeSocket:   null,   // Unix socket for MCP auth proxy
     mcpBridgePort:     null,   // target TCP port of MCP server on localhost
-    mcpBearerToken:    null,   // Bearer token to inject into MCP requests
+    mcpBearerToken:    process.env.MCP_BEARER_TOKEN || null,   // Bearer token from env (not CLI)
     bridgeOnly:        false,
     bridgeSocket:      null,
     bridgeTcpPort:     null,
@@ -92,6 +98,8 @@ function parseArgs(argv) {
       case '--notify-webhook':     args.notifyWebhook = argv[++i]; break;
       case '--mcp-bridge-socket':  args.mcpBridgeSocket = argv[++i]; break;
       case '--mcp-bridge-port':    args.mcpBridgePort = parseInt(argv[++i], 10); break;
+      // HIGH-3: bearer token read from MCP_BEARER_TOKEN env var (not CLI) to avoid /proc leak.
+      // --mcp-bearer-token kept for backwards compat but env var is preferred.
       case '--mcp-bearer-token':   args.mcpBearerToken = argv[++i]; break;
       case '--enable-github':       args.enableGithub = true; break;
       case '--bridge-only':         args.bridgeOnly = true; break;
@@ -217,6 +225,11 @@ function sendNotification(event, message, notifyCommand, notifyWebhook) {
       event, timestamp: new Date().toISOString(),
     });
     const u = new URL(notifyWebhook);
+    // MED-1: only allow https webhooks to prevent SSRF to internal services.
+    if (u.protocol !== 'https:') {
+      console.warn(`[notify] webhook rejected: only https allowed (got ${u.protocol})`);
+      return;
+    }
     const reqOpts = {
       hostname: u.hostname, port: u.port || 443, path: u.pathname + u.search,
       method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
@@ -293,7 +306,8 @@ function forward(method, urlPath, headers, body, res, verbose, onRetry) {
 
   req.on('error', (err) => {
     console.error('[anthropic] upstream error:', err.message);
-    if (!res.headersSent) { res.writeHead(502); res.end(`Bad Gateway: ${err.message}`); }
+    // MED-3: generic error to sandbox; details logged server-side only.
+    if (!res.headersSent) { res.writeHead(502); res.end('Bad Gateway'); }
   });
 
   if (body && body.length) req.write(body);
@@ -313,7 +327,8 @@ function createHandler(verbose) {
     if (!ANTHROPIC_PATH_ALLOWLIST.test(normalizedPath)) {
       if (verbose) console.log(`[anthropic] blocked path: ${normalizedPath}`);
       res.writeHead(403, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: `Path not allowed: ${normalizedPath}` }));
+      // MED-3: don't leak internal path details to sandbox.
+      res.end(JSON.stringify({ error: 'Path not allowed' }));
       return;
     }
 
@@ -323,18 +338,23 @@ function createHandler(verbose) {
 
     const chunks = [];
     let bodyLen = 0;
+    let aborted = false;  // MED-2: guard against post-destroy data events
     req.on('data', (c) => {
+      if (aborted) return;
       bodyLen += c.length;
       if (bodyLen > MAX_BODY_SIZE) {
+        aborted = true;
         req.destroy();
-        res.writeHead(413, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Request body too large' }));
+        if (!res.headersSent) {
+          res.writeHead(413, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Request body too large' }));
+        }
         return;
       }
       chunks.push(c);
     });
     req.on('end', () => {
-      if (bodyLen > MAX_BODY_SIZE) return; // already responded with 413
+      if (aborted) return;
       const body = Buffer.concat(chunks);
       const base = filterRequestHeaders(req.headers);
       base['host'] = 'api.anthropic.com';
@@ -374,6 +394,7 @@ function startTcpBridge(socketPath, port, label) {
     tcp.on('close', cleanup);
     unix.on('close', cleanup);
   });
+  server.maxConnections = MAX_CONNECTIONS;  // MED-4: prevent FD exhaustion
   server.listen(port, '127.0.0.1', () =>
     console.log(`${tag} TCP 127.0.0.1:${port} → Unix ${socketPath}`));
   server.on('error', (err) => { console.error(`${tag} TCP error:`, err.message); process.exit(1); });
@@ -391,30 +412,65 @@ function startMcpAuthProxy(targetPort, socketPath, bearerToken) {
   if (fs.existsSync(socketPath)) fs.unlinkSync(socketPath);
 
   const server = http.createServer((req, res) => {
-    const opts = {
-      hostname: '127.0.0.1',
-      port: targetPort,
-      path: req.url,
-      method: req.method,
-      headers: { ...req.headers, authorization: `Bearer ${bearerToken}` },
-    };
-    // Remove host header to avoid confusion on upstream
-    delete opts.headers.host;
+    // HIGH-2: path allowlist — only allow /mcp and /sse endpoints.
+    const parsed = new URL(req.url, 'http://localhost');
+    const normPath = path.posix.normalize(parsed.pathname);
+    if (!MCP_PATH_ALLOWLIST.test(normPath)) {
+      res.writeHead(403);
+      res.end('Path not allowed');
+      return;
+    }
 
-    const upstream = http.request(opts, (upRes) => {
-      res.writeHead(upRes.statusCode, upRes.headers);
-      upRes.pipe(res);
+    // HIGH-2: body size limit (same as Anthropic proxy).
+    let bodyLen = 0;
+    let aborted = false;
+    const chunks = [];
+
+    req.on('data', (c) => {
+      if (aborted) return;
+      bodyLen += c.length;
+      if (bodyLen > MAX_BODY_SIZE) {
+        aborted = true;
+        req.destroy();
+        if (!res.headersSent) { res.writeHead(413); res.end('Request body too large'); }
+        return;
+      }
+      chunks.push(c);
     });
-    upstream.on('error', (err) => {
-      console.error(`${tag} upstream error:`, err.message);
-      if (!res.headersSent) res.writeHead(502);
-      res.end('Bad Gateway');
+
+    req.on('end', () => {
+      if (aborted) return;
+      const body = Buffer.concat(chunks);
+      const opts = {
+        hostname: '127.0.0.1',
+        port: targetPort,
+        path: normPath + parsed.search,
+        method: req.method,
+        headers: { ...req.headers, authorization: `Bearer ${bearerToken}` },
+      };
+      delete opts.headers.host;
+      if (body.length) opts.headers['content-length'] = String(body.length);
+
+      const upstream = http.request(opts, (upRes) => {
+        res.writeHead(upRes.statusCode, upRes.headers);
+        upRes.pipe(res);
+      });
+      upstream.on('error', (err) => {
+        console.error(`${tag} upstream error:`, err.message);
+        if (!res.headersSent) res.writeHead(502);
+        res.end('Bad Gateway');
+      });
+      if (body.length) upstream.write(body);
+      upstream.end();
     });
-    req.pipe(upstream);
   });
 
+  server.maxConnections = MAX_CONNECTIONS;
+  // LOW-4: request timeout to prevent slowloris.
+  server.requestTimeout = 120_000;
+  server.headersTimeout = 30_000;
   server.listen(socketPath, () =>
-    console.log(`${tag} Unix ${socketPath} → HTTP 127.0.0.1:${targetPort} (auth injected)`));
+    console.log(`${tag} Unix ${socketPath} → HTTP 127.0.0.1:${targetPort} (auth injected, path: ${MCP_PATH_ALLOWLIST})`));
   server.on('error', (err) => { console.error(`${tag} error:`, err.message); process.exit(1); });
   return server;
 }
@@ -456,7 +512,9 @@ function makeConnectHandler(allowlist, verbose) {
       const targetPort = colonIdx >= 0 ? parseInt(target.slice(colonIdx + 1), 10) : 443;
 
       // HIGH-1: reject anything that is not in the allowlist on exactly port 443.
-      if (!allowlist.includes(host) || targetPort !== 443) {
+      // HIGH-4: case-insensitive comparison to prevent bypass via mixed-case hostnames.
+      const hostLower = host.toLowerCase();
+      if (!allowlist.some(h => h.toLowerCase() === hostLower) || targetPort !== 443) {
         if (verbose || allowlist.length > 0) {
           console.warn(`[github-connect] blocked CONNECT ${target}`);
         }
@@ -491,6 +549,7 @@ function makeConnectHandler(allowlist, verbose) {
 function startConnectProxy(port, allowlist, verbose) {
   const handler = makeConnectHandler(allowlist, verbose);
   const server = net.createServer(handler);
+  server.maxConnections = MAX_CONNECTIONS;
 
   server.listen(port, '127.0.0.1', () => {
     const desc = allowlist.length ? `${allowlist.join(', ')}:443` : '(none — all blocked)';
@@ -506,6 +565,7 @@ function startConnectProxy(port, allowlist, verbose) {
 function startConnectProxySocket(socketPath, allowlist, verbose) {
   const handler = makeConnectHandler(allowlist, verbose);
   const server = net.createServer(handler);
+  server.maxConnections = MAX_CONNECTIONS;
 
   if (fs.existsSync(socketPath)) fs.unlinkSync(socketPath);
   server.listen(socketPath, () => {
@@ -539,6 +599,10 @@ if (args.bridgeOnly) {
   if (fs.existsSync(socketPath)) fs.unlinkSync(socketPath);
 
   const server = http.createServer(createHandler(args.verbose));
+  server.maxConnections = MAX_CONNECTIONS;
+  // LOW-4: request/headers timeout to prevent slowloris from sandbox.
+  server.requestTimeout = 120_000;
+  server.headersTimeout = 30_000;
   server.listen(socketPath, () => {
     console.log(`[anthropic] Listening on ${socketPath}`);
     // HIGH-3: do NOT chmod to 0o666. Default umask (typically 0o600/0o660) is correct.
