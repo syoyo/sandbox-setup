@@ -85,6 +85,9 @@ sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 ./claudebox.sh --workdir ~/projects/myapp
 
 # Enable GitHub access (MCP server — recommended)
+# Reads token from ~/.config/claudebox/gh-token automatically:
+./claudebox.sh --enable-github-mcp
+# Or pass token explicitly:
 GH_TOKEN=ghp_xxx ./claudebox.sh --enable-github-mcp
 
 # Enable GitHub access (CONNECT proxy — unrecommended)
@@ -94,10 +97,10 @@ GH_TOKEN=ghp_xxx ./claudebox.sh --enable-github
 ./claudebox.sh --mem-limit 4G --cpu-limit 400
 
 # Full example
-GH_TOKEN=ghp_xxx ./claudebox.sh \
+./claudebox.sh \
   --workdir ~/projects/myapp \
   --mount-claude-md \
-  --enable-github \
+  --enable-github-mcp \
   --mem-limit 8G \
   --cpu-limit 800 \
   -- --continue
@@ -114,9 +117,10 @@ GH_TOKEN=ghp_xxx ./claudebox.sh \
 --share-claude-dir     Mount entire ~/.claude read-only (credentials replaced with dummies).
 --sandbox-home DIR     Copy files from DIR into sandbox home at startup.
 --enable-github-mcp    Enable GitHub access via MCP server (recommended). Requires GH_TOKEN
-                       and github-mcp-server on host.
---mcp-port PORT        TCP port for MCP server bridge (default: 58082).
+                       (env or ~/.config/claudebox/gh-token) and github-mcp-server on host.
 --enable-github        Enable GitHub access via CONNECT proxy + gh CLI (unrecommended).
+--gh-token-file FILE   Read GitHub PAT from FILE (default: ~/.config/claudebox/gh-token).
+--mcp-port PORT        TCP port for MCP server bridge (default: 58082).
 --disable-github       Explicitly disable GitHub access (default).
 --share-network        Share host network namespace (weaker isolation; default: isolated).
 --bind-binaries        Bind-mount node and claude from host paths into /run/sandbox-bin.
@@ -160,8 +164,13 @@ Claude Code auto-discovers it through a generated MCP config.
 # Install github-mcp-server (Go binary)
 go install github.com/github/github-mcp-server@latest
 
-# Run with MCP server
-GH_TOKEN=ghp_xxx ./claudebox.sh --enable-github-mcp --workdir ~/projects/myapp
+# Store your GitHub PAT (once)
+mkdir -p ~/.config/claudebox && chmod 700 ~/.config/claudebox
+echo "ghp_xxx" > ~/.config/claudebox/gh-token
+chmod 600 ~/.config/claudebox/gh-token
+
+# Run with MCP server (token loaded automatically)
+./claudebox.sh --enable-github-mcp --workdir ~/projects/myapp
 ```
 
 **Architecture**: `github-mcp-server http --port 58082` runs on the host. The credential
@@ -188,7 +197,7 @@ The CONNECT proxy enforces an allowlist: only `api.github.com:443` is permitted.
 other CONNECT targets are rejected with 403.
 
 ```bash
-# GH_TOKEN must be set in the environment
+# Token loaded from ~/.config/claudebox/gh-token, or pass explicitly:
 GH_TOKEN=ghp_xxx ./claudebox.sh --enable-github --shell --workdir work
 
 # Inside sandbox:
@@ -198,6 +207,38 @@ gh repo view owner/repo
 **Note**: `GH_TOKEN` is passed directly into the sandbox environment because the CONNECT
 proxy tunnels encrypted TLS traffic and cannot inject authentication headers. The token
 should be scoped with minimal permissions (read-only recommended).
+
+## Session Sharing
+
+By default, each sandbox starts with a fresh `~/.claude` directory and no conversation
+history. Use `--share-sessions` to persist session data so you can resume conversations
+from the host or another sandbox.
+
+```bash
+# Start a sandbox with session sharing
+./claudebox.sh --share-sessions --workdir ~/projects/myapp
+
+# Inside sandbox: have a conversation, then exit.
+# Later, resume from the host:
+claude --continue
+
+# Or resume in a new sandbox:
+./claudebox.sh --share-sessions --workdir ~/projects/myapp -- --continue
+```
+
+**What is shared** (read-write):
+- `~/.claude/projects/<project>/` — conversation JSONL files, subagent data, tool results
+- `~/.claude/history.jsonl` — session history for `--continue` and `--resume`
+
+**What is shared** (read-only):
+- `~/.claude/settings.json` — user settings for consistent behavior
+
+**What is NOT shared**: credentials (always dummy), debug logs, cache, stats.
+
+**Security note**: Session JSONL files written by the sandbox are replayed when resumed.
+If you resume a shared session **on the host without a sandbox**, any tool calls in the
+conversation history execute on the bare host. Always resume shared sessions inside a
+sandbox, or review the conversation history before resuming on the host.
 
 ## Resource Limits
 

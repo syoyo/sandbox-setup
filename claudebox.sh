@@ -58,6 +58,7 @@ SANDBOX_HOME="/home/sandbox"
 WORKDIR="$(pwd)"
 MOUNT_CLAUDE_MD=false
 SHARE_CLAUDE_DIR=false
+SHARE_SESSIONS=false
 ISOLATE_NET=true
 BIND_BINARIES=false
 LAUNCH_SHELL=false
@@ -76,6 +77,7 @@ IDLE_TIMEOUT=15        # minutes: warn if no Anthropic request for this long (0=
 ATTACH_MODE=false      # --attach: connect to existing sandbox
 NOTIFY_COMMAND=""      # shell command for event notifications
 NOTIFY_WEBHOOK=""      # webhook URL for event notifications (Slack, etc.)
+GH_TOKEN_FILE=""       # file containing GitHub PAT (alternative to GH_TOKEN env var)
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -84,6 +86,7 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     --mount-claude-md)   MOUNT_CLAUDE_MD=true; shift ;;
     --share-claude-dir)  SHARE_CLAUDE_DIR=true; shift ;;
+    --share-sessions)    SHARE_SESSIONS=true; shift ;;
     --share-network)     ISOLATE_NET=false; shift ;;
     --bind-binaries)     BIND_BINARIES=true; shift ;;
     --shell)             LAUNCH_SHELL=true; shift ;;
@@ -92,6 +95,7 @@ while [[ $# -gt 0 ]]; do
     --sandbox-home)      SANDBOX_HOME_SEED=$2; shift 2 ;;
     --enable-github)     ENABLE_GITHUB=true;  shift ;;
     --disable-github)    ENABLE_GITHUB=false; shift ;;
+    --gh-token-file)     GH_TOKEN_FILE=$2; shift 2 ;;
     --enable-github-mcp) ENABLE_GITHUB_MCP=true; shift ;;
     --mcp-port)
       [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1024 && $2 <= 65535 )) || { echo "❌ --mcp-port: invalid port '$2' (1024-65535)"; exit 1; }
@@ -127,6 +131,9 @@ USAGE:
 OPTIONS:
   --share-claude-dir     Mount ~/.claude read-only into the sandbox (history, settings, etc.)
                          .credentials.json is automatically replaced with dummy tokens.
+  --share-sessions       Share session data (read-write) so conversations can be resumed
+                         from the host or another sandbox. Mounts the project-specific
+                         directory under ~/.claude/projects/ and ~/.claude/session-env/.
   --mount-claude-md      Mount ~/.claude/CLAUDE.md only (subset of --share-claude-dir)
   --share-network        Share host network namespace (weaker isolation; default: isolated).
                          Default (isolated) requires on Ubuntu 22.04+:
@@ -140,9 +147,11 @@ OPTIONS:
   --sandbox-home DIR     Copy files from DIR into the sandbox home at startup.
   --enable-github-mcp    Enable GitHub access via MCP server (recommended; requires GH_TOKEN
                          and github-mcp-server binary on host).
-  --mcp-port PORT        TCP port for MCP server bridge (default: 58082; range 1024-65535).
   --enable-github        Enable GitHub access via CONNECT proxy + gh CLI (unrecommended;
                          use --enable-github-mcp instead). Requires GH_TOKEN on host.
+  --gh-token-file FILE   Read GitHub PAT from FILE (default: ~/.config/claudebox/gh-token).
+                         The GH_TOKEN env var takes priority if set.
+  --mcp-port PORT        TCP port for MCP server bridge (default: 58082; range 1024-65535).
   --mem-limit SIZE       Memory limit (e.g. 4G, 512M). Uses cgroups via systemd-run.
   --cpu-limit PERCENT    CPU limit as percentage (100 = 1 core, 200 = 2 cores).
   --idle-timeout MINS    Warn when no Anthropic API request for MINS minutes (default: 15, 0=off).
@@ -161,7 +170,7 @@ NETWORK:
     Share host network namespace (weaker: raw sockets can bypass proxy).
 
 ENVIRONMENT:
-  GH_TOKEN               GitHub token (required with --enable-github)
+  GH_TOKEN               GitHub token (or use --gh-token-file / ~/.config/claudebox/gh-token)
   CLAUDE_CREDENTIALS_FILE  Override Claude credentials file path
 
 SECURITY PROPERTIES:
@@ -210,6 +219,23 @@ fi
   echo "❌ --anthropic-port and --github-port must be different"; exit 1; }
 [[ "$PORT_ANTHROPIC" -ne "$PORT_MCP" && "$PORT_GITHUB_CONNECT" -ne "$PORT_MCP" ]] || {
   echo "❌ --mcp-port must differ from --anthropic-port and --github-port"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Load GH_TOKEN from file if --gh-token-file or default location
+# Priority: GH_TOKEN env > --gh-token-file > ~/.config/claudebox/gh-token
+# ---------------------------------------------------------------------------
+_DEFAULT_GH_TOKEN_FILE="$HOME/.config/claudebox/gh-token"
+if [[ -z "${GH_TOKEN:-}" ]]; then
+  _token_file="${GH_TOKEN_FILE:-$_DEFAULT_GH_TOKEN_FILE}"
+  if [[ -n "$GH_TOKEN_FILE" ]]; then
+    [[ -f "$_token_file" ]] || { echo "❌ --gh-token-file: file not found: $_token_file"; exit 1; }
+  fi
+  if [[ -f "$_token_file" ]]; then
+    GH_TOKEN=$(head -1 "$_token_file" | tr -d '[:space:]')
+    [[ -n "$GH_TOKEN" ]] || { echo "❌ GitHub token file is empty: $_token_file"; exit 1; }
+    echo "✔ GitHub token loaded from $_token_file"
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # Validate and canonicalise workdir (HIGH-4: symlink/path traversal)
@@ -549,6 +575,44 @@ fi
 
 if [[ "$MOUNT_CLAUDE_MD" == true && "$SHARE_CLAUDE_DIR" == false && -f "$HOME/.claude/CLAUDE.md" ]]; then
   BWRAP+=(--ro-bind "$HOME/.claude/CLAUDE.md" "$SANDBOX_HOME/.claude/CLAUDE.md")
+fi
+
+# Session sharing: bind-mount project-specific conversation data (rw) so that
+# sessions can be resumed from the host or another sandbox.
+# Claude Code stores sessions in ~/.claude/projects/<project-dir-name>/.
+# The project dir name is the workdir path with / replaced by -.
+if [[ "$SHARE_SESSIONS" == true ]]; then
+  # Compute project directory name: /home/user/work/foo → -home-user-work-foo
+  _project_dir_name=$(echo "$WORKDIR" | tr '/' '-')
+  _host_project_dir="$HOME/.claude/projects/$_project_dir_name"
+  _sandbox_project_dir="$SANDBOX_HOME/.claude/projects/$_project_dir_name"
+
+  # Create host-side directories if they don't exist
+  mkdir -p "$_host_project_dir"
+
+  # Bind-mount project session data (rw — claude writes conversation JSONL here)
+  BWRAP+=(
+    --dir "$SANDBOX_HOME/.claude/projects"
+    --bind "$_host_project_dir" "$_sandbox_project_dir"
+  )
+
+  # Share settings (read-only) for consistent behavior across sessions
+  if [[ -f "$HOME/.claude/settings.json" ]]; then
+    BWRAP+=(--ro-bind "$HOME/.claude/settings.json" "$SANDBOX_HOME/.claude/settings.json")
+  fi
+
+  # Share history (read-only) so `--continue` and `--resume` can find sessions.
+  # HIGH-1: rw would let sandbox poison host session history; ro is sufficient
+  # because Claude Code reads history to list sessions but writes new entries
+  # to the project JSONL which is already rw.
+  if [[ -f "$HOME/.claude/history.jsonl" ]]; then
+    BWRAP+=(--ro-bind "$HOME/.claude/history.jsonl" "$SANDBOX_HOME/.claude/history.jsonl")
+  fi
+
+  echo "✔ Session sharing enabled (project: $_project_dir_name)"
+  # HIGH-2: warn about session resume risk — sandboxed code can write crafted
+  # JSONL that replays on the host when resumed without a sandbox.
+  echo "  ⚠ When resuming shared sessions on the host, review conversation history first."
 fi
 
 # HIGH-5: only bind ~/.local/bin/claude if it is owned by the current user
