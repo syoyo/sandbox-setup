@@ -6,8 +6,8 @@
  * Listens on a Unix domain socket (host side), replaces dummy Claude tokens
  * with real ones before forwarding requests to api.anthropic.com.
  *
- * GitHub credentials are NOT proxied — gh CLI uses HTTPS with no URL-override
- * mechanism, so GH_TOKEN is passed directly into the sandbox instead.
+ * Also runs a HTTPS CONNECT proxy that whitelists specific upstream hosts
+ * (empty allowlist by default; api.github.com added with --enable-github).
  *
  * Normal usage: run claudebox.sh, which starts this proxy automatically.
  *   ./claudebox.sh [OPTIONS] [-- CLAUDE_ARGS...]
@@ -15,7 +15,8 @@
  * Manual host usage (advanced):
  *   node credential-proxy.js \
  *     --anthropic-socket /tmp/claude-proxy-anthropic.sock \
- *     --anthropic-tcp-port 58080
+ *     --anthropic-tcp-port 58080 \
+ *     --github-connect-port 58081 [--enable-github]
  *
  * In-sandbox bridge mode (started by claudebox.sh --no-network):
  *   node credential-proxy.js --bridge-only \
@@ -24,13 +25,13 @@
 
 'use strict';
 
-const http = require('http');
+const http  = require('http');
 const https = require('https');
-const net = require('net');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
-const { execSync } = require('child_process');
+const net   = require('net');
+const fs    = require('fs');
+const os    = require('os');
+const path  = require('path');
+const { spawnSync } = require('child_process');
 
 // ---------------------------------------------------------------------------
 // Dummy token placed in the sandbox by claudebox.sh.
@@ -39,11 +40,16 @@ const { execSync } = require('child_process');
 const DUMMY_CLAUDE_TOKEN =
   'sk-ant-oat01-dummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDQ-DummyAA';
 
-const DEFAULT_ANTHROPIC_SOCKET = '/tmp/claude-proxy-anthropic.sock';
-const DEFAULT_ANTHROPIC_PORT   = 58080;
+const DEFAULT_ANTHROPIC_SOCKET    = '/tmp/claude-proxy-anthropic.sock';
+const DEFAULT_ANTHROPIC_PORT      = 58080;
 const DEFAULT_GITHUB_CONNECT_PORT = 58081;
 
-// Full allowlist when --enable-github is active.
+// Paths the Anthropic proxy will forward. Anything outside this set is rejected
+// with 403, preventing the sandbox from abusing the proxy for non-inference calls.
+// (HIGH-2: restrict proxy to known-safe Anthropic API paths)
+const ANTHROPIC_PATH_ALLOWLIST = /^\/v1\/(messages|complete|models|count_tokens)(\/|$)/;
+
+// Hosts the CONNECT proxy is allowed to tunnel to (HIGH-1: enforced per-entry).
 const GITHUB_ALLOWLIST = ['api.github.com'];
 
 // ---------------------------------------------------------------------------
@@ -52,27 +58,26 @@ const GITHUB_ALLOWLIST = ['api.github.com'];
 
 function parseArgs(argv) {
   const args = {
-    anthropicSocket:     null,
-    anthropicTcpPort:    null,
-    githubConnectPort:   null,   // HTTPS CONNECT proxy port (always started)
-    enableGithub:        false,  // --enable-github: adds api.github.com to allowlist
-    // Bridge-only mode
-    bridgeOnly:    false,
-    bridgeSocket:  null,
-    bridgeTcpPort: null,
-    verbose: false,
+    anthropicSocket:   null,
+    anthropicTcpPort:  null,
+    githubConnectPort: null,
+    enableGithub:      false,
+    bridgeOnly:        false,
+    bridgeSocket:      null,
+    bridgeTcpPort:     null,
+    verbose:           false,
   };
 
   for (let i = 2; i < argv.length; i++) {
     switch (argv[i]) {
-      case '--anthropic-socket':   args.anthropicSocket   = argv[++i]; break;
-      case '--anthropic-tcp-port': args.anthropicTcpPort  = parseInt(argv[++i], 10); break;
-      case '--github-connect-port':args.githubConnectPort = parseInt(argv[++i], 10); break;
-      case '--enable-github':      args.enableGithub = true; break;
-      case '--bridge-only':        args.bridgeOnly = true; break;
-      case '--socket':             args.bridgeSocket   = argv[++i]; break;
-      case '--tcp-bridge-port':    args.bridgeTcpPort  = parseInt(argv[++i], 10); break;
-      case '--verbose':            args.verbose = true; break;
+      case '--anthropic-socket':    args.anthropicSocket   = argv[++i]; break;
+      case '--anthropic-tcp-port':  args.anthropicTcpPort  = parseInt(argv[++i], 10); break;
+      case '--github-connect-port': args.githubConnectPort = parseInt(argv[++i], 10); break;
+      case '--enable-github':       args.enableGithub = true; break;
+      case '--bridge-only':         args.bridgeOnly = true; break;
+      case '--socket':              args.bridgeSocket  = argv[++i]; break;
+      case '--tcp-bridge-port':     args.bridgeTcpPort = parseInt(argv[++i], 10); break;
+      case '--verbose':             args.verbose = true; break;
       case '--help': printHelp(); process.exit(0); break;
       default: console.warn(`[proxy] Unknown argument: ${argv[i]}`);
     }
@@ -87,12 +92,14 @@ function parseArgs(argv) {
 
 function printHelp() {
   console.log(`
-credential-proxy.js — Anthropic credential proxy for sandboxed Claude Code
+credential-proxy.js — Anthropic credential proxy + HTTPS CONNECT gateway
 
-PROXY MODE (host side):
+PROXY MODE (host side — claudebox.sh manages this automatically):
   node credential-proxy.js \\
-    --anthropic-socket PATH   Unix socket (default: ${DEFAULT_ANTHROPIC_SOCKET})
-    --anthropic-tcp-port PORT Also open a host-side TCP bridge (default: ${DEFAULT_ANTHROPIC_PORT})
+    --anthropic-socket PATH     Unix socket (default: ${DEFAULT_ANTHROPIC_SOCKET})
+    --anthropic-tcp-port PORT   Host-side TCP bridge (default: ${DEFAULT_ANTHROPIC_PORT})
+    --github-connect-port PORT  HTTPS CONNECT proxy port (default: ${DEFAULT_GITHUB_CONNECT_PORT})
+    --enable-github             Add api.github.com to CONNECT allowlist
     --verbose
 
 BRIDGE-ONLY MODE (in-sandbox, for --no-network):
@@ -105,7 +112,7 @@ ENVIRONMENT:
 }
 
 // ---------------------------------------------------------------------------
-// Credential retrieval
+// Credential retrieval (Anthropic)
 // ---------------------------------------------------------------------------
 
 let _credsCache = null;
@@ -124,14 +131,21 @@ function getClaudeCredentials() {
     try { creds = JSON.parse(fs.readFileSync(envFile, 'utf8')); } catch (_) {}
   }
 
-  // 2. macOS Keychain
+  // 2. macOS Keychain (LOW-5 fix: use spawnSync with arg array, not shell interpolation)
   if (!creds && process.platform === 'darwin') {
     try {
-      const raw = execSync(
-        `security find-generic-password -s "Claude Code-credentials" -a "${os.userInfo().username}" -w 2>/dev/null`,
-        { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-      ).trim();
-      if (raw) creds = JSON.parse(raw);
+      const username = os.userInfo().username;
+      // Validate username to guard against unexpected characters
+      if (/^[a-zA-Z0-9._-]+$/.test(username)) {
+        const result = spawnSync(
+          'security',
+          ['find-generic-password', '-s', 'Claude Code-credentials', '-a', username, '-w'],
+          { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+        );
+        if (result.status === 0 && result.stdout.trim()) {
+          creds = JSON.parse(result.stdout.trim());
+        }
+      }
     } catch (_) {}
   }
 
@@ -159,7 +173,7 @@ function getAccessToken() {
 function invalidateCache() { _credsCache = null; }
 
 // ---------------------------------------------------------------------------
-// Request handling
+// Anthropic proxy request handling
 // ---------------------------------------------------------------------------
 
 function filterRequestHeaders(headers) {
@@ -195,10 +209,14 @@ function injectToken(headers, verbose) {
       updated[k] = v;
     }
   }
+
+  // HIGH-2: require a dummy token to be present; reject requests with no auth.
+  // This prevents sandbox code from making arbitrary Anthropic calls without
+  // the dummy credential structure that Claude Code always sends.
   if (!replaced) {
-    if (verbose) console.log('[anthropic] No dummy token; injecting Authorization header');
-    updated['Authorization'] = `Bearer ${token}`;
+    return { ok: false, error: 'Request carries no dummy Claude token; injection refused' };
   }
+
   return { ok: true, headers: updated };
 }
 
@@ -228,6 +246,14 @@ function forward(method, urlPath, headers, body, res, verbose, onRetry) {
 
 function createHandler(verbose) {
   return function (req, res) {
+    // HIGH-2: restrict to known Anthropic inference paths only.
+    if (!ANTHROPIC_PATH_ALLOWLIST.test(req.url)) {
+      if (verbose) console.log(`[anthropic] blocked path: ${req.url}`);
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: `Path not allowed: ${req.url}` }));
+      return;
+    }
+
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
     req.on('end', () => {
@@ -240,7 +266,7 @@ function createHandler(verbose) {
         const result = injectToken(retry ? filterRequestHeaders(req.headers) : base, verbose);
         if (!result.ok) {
           console.error('[anthropic] credential error:', result.error);
-          res.writeHead(500, { 'content-type': 'application/json' });
+          res.writeHead(401, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: result.error }));
           return;
         }
@@ -270,18 +296,19 @@ function startTcpBridge(socketPath, port, label) {
     tcp.on('close', cleanup);
     unix.on('close', cleanup);
   });
-  server.listen(port, '127.0.0.1', () => console.log(`${tag} TCP 127.0.0.1:${port} → Unix ${socketPath}`));
+  server.listen(port, '127.0.0.1', () =>
+    console.log(`${tag} TCP 127.0.0.1:${port} → Unix ${socketPath}`));
   server.on('error', (err) => { console.error(`${tag} TCP error:`, err.message); process.exit(1); });
   return server;
 }
 
 // ---------------------------------------------------------------------------
-// HTTPS CONNECT proxy — whitelists specific upstream hosts
+// HTTPS CONNECT proxy — whitelists specific upstream host:port pairs
+// HIGH-1: enforces both hostname AND port (must be 443)
 // ---------------------------------------------------------------------------
 
 function startConnectProxy(port, allowlist, verbose) {
   const server = net.createServer((client) => {
-    // Accumulate data until the full HTTP CONNECT request headers arrive.
     const bufs = [];
     let totalLen = 0;
 
@@ -291,38 +318,39 @@ function startConnectProxy(port, allowlist, verbose) {
       const combined = Buffer.concat(bufs, totalLen);
       const headerEnd = combined.indexOf('\r\n\r\n');
       if (headerEnd === -1) {
-        if (totalLen > 8192) { client.destroy(); } // header too large
+        if (totalLen > 8192) client.destroy();
         return;
       }
 
-      // Stop accumulating; parse the CONNECT request.
       client.removeListener('data', onData);
 
-      const header = combined.slice(0, headerEnd).toString('ascii');
-      const afterHeader = combined.slice(headerEnd + 4); // any bytes past the headers
-      const firstLine = header.split('\r\n')[0];
+      const header      = combined.slice(0, headerEnd).toString('ascii');
+      const afterHeader = combined.slice(headerEnd + 4);
+      const firstLine   = header.split('\r\n')[0];
       const [method, target] = firstLine.split(' ');
 
       if (method !== 'CONNECT') {
-        client.end('HTTP/1.1 405 Method Not Allowed\r\n\r\n');
+        client.end('HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n');
         return;
       }
 
-      const colonIdx = target.lastIndexOf(':');
-      const host = colonIdx >= 0 ? target.slice(0, colonIdx) : target;
-      const port  = colonIdx >= 0 ? parseInt(target.slice(colonIdx + 1), 10) : 443;
+      const colonIdx   = target.lastIndexOf(':');
+      const host       = colonIdx >= 0 ? target.slice(0, colonIdx) : target;
+      const targetPort = colonIdx >= 0 ? parseInt(target.slice(colonIdx + 1), 10) : 443;
 
-      if (!allowlist.includes(host)) {
-        if (verbose) console.log(`[github-connect] blocked CONNECT ${target}`);
+      // HIGH-1: reject anything that is not in the allowlist on exactly port 443.
+      if (!allowlist.includes(host) || targetPort !== 443) {
+        if (verbose || allowlist.length > 0) {
+          console.warn(`[github-connect] blocked CONNECT ${target}`);
+        }
         client.end('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n');
         return;
       }
 
       if (verbose) console.log(`[github-connect] → CONNECT ${target}`);
 
-      const upstream = net.createConnection(port, host, () => {
+      const upstream = net.createConnection(targetPort, host, () => {
         client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        // Replay any bytes that arrived after the CONNECT headers.
         if (afterHeader.length) upstream.write(afterHeader);
         client.pipe(upstream);
         upstream.pipe(client);
@@ -343,10 +371,13 @@ function startConnectProxy(port, allowlist, verbose) {
   });
 
   server.listen(port, '127.0.0.1', () => {
-    const desc = allowlist.length ? allowlist.join(', ') : '(none — all blocked)';
+    const desc = allowlist.length ? `${allowlist.join(', ')}:443` : '(none — all blocked)';
     console.log(`[github-connect] CONNECT proxy 127.0.0.1:${port}, allowlist: ${desc}`);
   });
-  server.on('error', (err) => { console.error('[github-connect] error:', err.message); process.exit(1); });
+  server.on('error', (err) => {
+    console.error('[github-connect] error:', err.message);
+    process.exit(1);
+  });
   return server;
 }
 
@@ -373,9 +404,13 @@ if (args.bridgeOnly) {
   const server = http.createServer(createHandler(args.verbose));
   server.listen(socketPath, () => {
     console.log(`[anthropic] Listening on ${socketPath}`);
-    try { fs.chmodSync(socketPath, 0o666); } catch (_) {}
+    // HIGH-3: do NOT chmod to 0o666. Default umask (typically 0o600/0o660) is correct.
+    // The sandbox user matches the host user (--uid $(id -u)), so no extra permissions needed.
   });
-  server.on('error', (err) => { console.error('[anthropic] Server error:', err.message); process.exit(1); });
+  server.on('error', (err) => {
+    console.error('[anthropic] Server error:', err.message);
+    process.exit(1);
+  });
 
   startTcpBridge(socketPath, tcpPort, 'anthropic');
 
@@ -384,9 +419,13 @@ if (args.bridgeOnly) {
     startConnectProxy(args.githubConnectPort, allowlist, args.verbose);
   }
 
-  const cleanup = () => { try { fs.unlinkSync(socketPath); } catch (_) {} process.exit(0); };
+  const cleanup = () => {
+    try { fs.unlinkSync(socketPath); } catch (_) {}
+    process.exit(0);
+  };
   process.on('SIGINT', cleanup);
   process.on('SIGTERM', cleanup);
 
   console.log('[anthropic] Credential sources: CLAUDE_CREDENTIALS_FILE → macOS Keychain → ~/.claude/.credentials.json');
+  console.log('[anthropic] Path allowlist:', ANTHROPIC_PATH_ALLOWLIST.toString());
 }
