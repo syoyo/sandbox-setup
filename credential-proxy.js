@@ -72,6 +72,8 @@ function parseArgs(argv) {
     idleTimeout:       0,       // minutes; 0 = disabled
     notifyCommand:     null,
     notifyWebhook:     null,
+    mcpBridgeSocket:   null,   // Unix socket for reverse bridge to MCP server
+    mcpBridgePort:     null,   // target TCP port of MCP server on localhost
     bridgeOnly:        false,
     bridgeSocket:      null,
     bridgeTcpPort:     null,
@@ -87,6 +89,8 @@ function parseArgs(argv) {
       case '--idle-timeout':        args.idleTimeout   = parseInt(argv[++i], 10); break;
       case '--notify-command':     args.notifyCommand = argv[++i]; break;
       case '--notify-webhook':     args.notifyWebhook = argv[++i]; break;
+      case '--mcp-bridge-socket':  args.mcpBridgeSocket = argv[++i]; break;
+      case '--mcp-bridge-port':    args.mcpBridgePort = parseInt(argv[++i], 10); break;
       case '--enable-github':       args.enableGithub = true; break;
       case '--bridge-only':         args.bridgeOnly = true; break;
       case '--socket':              args.bridgeSocket  = argv[++i]; break;
@@ -375,6 +379,29 @@ function startTcpBridge(socketPath, port, label) {
 }
 
 // ---------------------------------------------------------------------------
+// Reverse TCP bridge: Unix socket → TCP (for host-side services like MCP server)
+// ---------------------------------------------------------------------------
+
+function startReverseBridge(targetPort, socketPath, label) {
+  const tag = `[${label ?? 'reverse-bridge'}]`;
+  if (fs.existsSync(socketPath)) fs.unlinkSync(socketPath);
+  const server = net.createServer((unix) => {
+    const tcp = net.createConnection(targetPort, '127.0.0.1');
+    unix.pipe(tcp);
+    tcp.pipe(unix);
+    const cleanup = () => { unix.destroy(); tcp.destroy(); };
+    unix.on('error', cleanup);
+    tcp.on('error', (err) => { console.error(`${tag} tcp error:`, err.message); cleanup(); });
+    unix.on('close', cleanup);
+    tcp.on('close', cleanup);
+  });
+  server.listen(socketPath, () =>
+    console.log(`${tag} Unix ${socketPath} → TCP 127.0.0.1:${targetPort}`));
+  server.on('error', (err) => { console.error(`${tag} error:`, err.message); process.exit(1); });
+  return server;
+}
+
+// ---------------------------------------------------------------------------
 // HTTPS CONNECT proxy — whitelists specific upstream host:port pairs
 // HIGH-1: enforces both hostname AND port (must be 443)
 // ---------------------------------------------------------------------------
@@ -517,9 +544,17 @@ if (args.bridgeOnly) {
     startConnectProxySocket(githubSocketPath, allowlist, args.verbose);
   }
 
+  // Reverse bridge for MCP server (Unix socket → TCP on host)
+  let mcpBridgeSocketPath = null;
+  if (args.mcpBridgeSocket && args.mcpBridgePort) {
+    mcpBridgeSocketPath = args.mcpBridgeSocket;
+    startReverseBridge(args.mcpBridgePort, mcpBridgeSocketPath, 'mcp-bridge');
+  }
+
   const cleanup = () => {
     try { fs.unlinkSync(socketPath); } catch (_) {}
     if (githubSocketPath) { try { fs.unlinkSync(githubSocketPath); } catch (_) {} }
+    if (mcpBridgeSocketPath) { try { fs.unlinkSync(mcpBridgeSocketPath); } catch (_) {} }
     process.exit(0);
   };
   process.on('SIGINT', cleanup);

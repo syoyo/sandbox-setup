@@ -7,39 +7,35 @@ Real API credentials stay on the host. The sandbox only sees dummy tokens, which
 ## Architecture
 
 ```
-Host                                             Anthropic API
-┌─────────────────────────────────────┐         ┌──────────────────┐
-│  credential-proxy.js                │         │                  │
-│  ├─ Anthropic proxy (Unix socket)   │────────>│ api.anthropic.com│
-│  │  dummy token → real token        │         │                  │
-│  └─ GitHub CONNECT proxy (Unix sock)│──┐      └──────────────────┘
-│                                     │  │
-└────────┬────────────────────┬───────┘  │      ┌──────────────────┐
-         │ bind-mount (ro)    │          └─────>│ api.github.com   │
-         │                    │                 │ (CONNECT tunnel) │
-┌────────▼────────────────────▼───────┐         └──────────────────┘
-│  bwrap sandbox (--unshare-net)      │
-│                                     │
-│  ┌────────────────────────────┐     │
-│  │ TCP bridge (loopback)      │     │  ← isolated net namespace
-│  │ 127.0.0.1:58080 → Anthropic│     │    no external network
-│  │ 127.0.0.1:58081 → GitHub   │     │    (GitHub bridge only
-│  └────────────┬───────────────┘     │     with --enable-github)
-│               │                     │
-│  ┌────────────▼───────────────┐     │
-│  │  claude                    │     │
-│  │  ANTHROPIC_BASE_URL=       │     │
-│  │    http://127.0.0.1:58080  │     │
-│  │  HTTPS_PROXY=              │     │
-│  │    http://127.0.0.1:58081  │     │
-│  └────────────────────────────┘     │
-│                                     │
-│  Filesystem:                        │
-│    /workspace     ← rw (workdir)    │
-│    /usr, /etc/*   ← ro (selective)  │
-│    /home/sandbox  ← tmpfs (fake)    │
-│    /sys, /tmp     ← tmpfs           │
-└─────────────────────────────────────┘
+Host                                              External APIs
+┌──────────────────────────────────────┐         ┌──────────────────┐
+│  credential-proxy.js                 │         │ api.anthropic.com│
+│  ├─ Anthropic proxy (Unix socket)    │────────>│                  │
+│  │  dummy token → real token         │         └──────────────────┘
+│  ├─ GitHub CONNECT proxy (Unix sock) │────────>┌──────────────────┐
+│  └─ MCP reverse bridge (Unix sock)   │──┐      │ api.github.com   │
+│                                      │  │      │ (CONNECT tunnel) │
+│  github-mcp-server http :58082 ◄─────┘  │      └──────────────────┘
+│  (--enable-github-mcp, recommended)  │  │
+└──────────┬───────────────────────────┘  │
+           │ bind-mount sockets (ro)      │
+┌──────────▼───────────────────────────┐  │
+│  bwrap sandbox (--unshare-net)       │  │
+│                                      │  │
+│  TCP bridges (loopback):             │  │   ← isolated net namespace
+│    :58080 → Anthropic proxy socket   │  │
+│    :58081 → GitHub CONNECT socket    │  │
+│    :58082 → MCP bridge socket        │  │
+│                                      │  │
+│  claude                              │  │
+│    ANTHROPIC_BASE_URL=:58080         │  │
+│    MCP server "github" → :58082/mcp  │  │
+│                                      │  │
+│  /workspace (rw), /usr /etc (ro)     │  │
+│  /home/sandbox (tmpfs)               │  │
+└──────────────────────────────────────┘  │
+                                          │
+       github-mcp-server ────────────────>│ api.github.com
 ```
 
 ## Requirements
@@ -88,7 +84,10 @@ sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 # Specific working directory
 ./claudebox.sh --workdir ~/projects/myapp
 
-# Enable GitHub access
+# Enable GitHub access (MCP server — recommended)
+GH_TOKEN=ghp_xxx ./claudebox.sh --enable-github-mcp
+
+# Enable GitHub access (CONNECT proxy — unrecommended)
 GH_TOKEN=ghp_xxx ./claudebox.sh --enable-github
 
 # With resource limits
@@ -114,7 +113,10 @@ GH_TOKEN=ghp_xxx ./claudebox.sh \
 --mount-claude-md      Mount ~/.claude/CLAUDE.md into sandbox (read-only).
 --share-claude-dir     Mount entire ~/.claude read-only (credentials replaced with dummies).
 --sandbox-home DIR     Copy files from DIR into sandbox home at startup.
---enable-github        Enable GitHub access via CONNECT proxy (requires GH_TOKEN env var).
+--enable-github-mcp    Enable GitHub access via MCP server (recommended). Requires GH_TOKEN
+                       and github-mcp-server on host.
+--mcp-port PORT        TCP port for MCP server bridge (default: 58082).
+--enable-github        Enable GitHub access via CONNECT proxy + gh CLI (unrecommended).
 --disable-github       Explicitly disable GitHub access (default).
 --share-network        Share host network namespace (weaker isolation; default: isolated).
 --bind-binaries        Bind-mount node and claude from host paths into /run/sandbox-bin.
@@ -147,7 +149,36 @@ bridges needed), but weaker isolation: any compiled binary or raw-socket code in
 sandbox can bypass the proxy and reach the internet directly. Use only for convenience
 during development.
 
-## GitHub Access
+## GitHub Access (MCP Server — Recommended)
+
+The recommended way to access GitHub from the sandbox is via the
+[GitHub MCP Server](https://github.com/github/github-mcp-server). This runs on the
+host in HTTP mode and is bridged into the sandbox via a reverse Unix socket bridge.
+Claude Code auto-discovers it through a generated MCP config.
+
+```bash
+# Install github-mcp-server (Go binary)
+go install github.com/github/github-mcp-server@latest
+
+# Run with MCP server
+GH_TOKEN=ghp_xxx ./claudebox.sh --enable-github-mcp --workdir ~/projects/myapp
+```
+
+**Architecture**: `github-mcp-server http --port 58082` runs on the host. The credential
+proxy creates a reverse bridge (Unix socket → TCP 58082). The socket is bind-mounted
+into the sandbox. An in-sandbox TCP bridge exposes it at `127.0.0.1:58082`. Claude Code
+connects via MCP streamable-http transport.
+
+**Advantages over `--enable-github`**:
+- No `GH_TOKEN` exposed inside the sandbox
+- No `gh` CLI or CONNECT proxy needed
+- Claude Code uses GitHub tools natively via MCP protocol
+- Token stays on the host (never enters the sandbox)
+
+## GitHub Access (CONNECT Proxy — Unrecommended)
+
+> **Note**: Prefer `--enable-github-mcp` above. This method exposes `GH_TOKEN` inside
+> the sandbox and requires the `gh` CLI.
 
 GitHub access uses an HTTPS CONNECT tunnel proxy. The sandbox's `HTTPS_PROXY` points
 to the in-sandbox bridge, which tunnels through to the host-side CONNECT proxy, which
@@ -325,6 +356,7 @@ attachments per event type.
 | **Filesystem** | Only `--workdir` is read-write; everything else read-only or tmpfs |
 | **Home directory** | Real `$HOME` not mounted; fake home at `/home/sandbox` (tmpfs) |
 | **Anthropic credentials** | Per-session random dummy token; real token injected by host proxy |
+| **GitHub token (MCP)** | Token stays on host; MCP server runs on host, only bridged socket enters sandbox |
 | **Proxy socket** | Bind-mounted read-only; sandbox can connect but not modify |
 | **Environment** | `--clearenv`; only explicit allowlist set |
 | **/etc** | Only ~12 specific files mounted (ld.so, SSL certs, DNS, passwd/group) |

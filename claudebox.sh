@@ -41,7 +41,9 @@ PROXY_SCRIPT="$SCRIPT_DIR/credential-proxy.js"
 _SOCK_DIR="${XDG_RUNTIME_DIR:-/tmp}"
 SOCKET_ANTHROPIC="$_SOCK_DIR/claude-proxy-anthropic-$$.sock"
 SOCKET_GITHUB="$_SOCK_DIR/claude-proxy-github-$$.sock"
+SOCKET_MCP="$_SOCK_DIR/claude-proxy-mcp-$$.sock"
 SANDBOX_SOCKET_ANTHROPIC="/tmp/claude-proxy-anthropic.sock"
+SANDBOX_SOCKET_MCP="/tmp/claude-proxy-mcp.sock"
 SANDBOX_SOCKET_GITHUB="/tmp/claude-proxy-github.sock"
 PORT_ANTHROPIC=58080
 PORT_GITHUB_CONNECT=58081   # HTTPS CONNECT proxy for api.github.com (in-sandbox bridge)
@@ -53,6 +55,9 @@ ISOLATE_NET=true
 BIND_BINARIES=false
 LAUNCH_SHELL=false
 ENABLE_GITHUB=false
+ENABLE_GITHUB_MCP=false
+PORT_MCP=58082             # in-sandbox TCP port for MCP bridge
+MCP_SERVER_PID=""
 CLAUDE_ARGS=()
 PROXY_PID=""
 TEMP_CREDS=""
@@ -80,6 +85,10 @@ while [[ $# -gt 0 ]]; do
     --sandbox-home)      SANDBOX_HOME_SEED=$2; shift 2 ;;
     --enable-github)     ENABLE_GITHUB=true;  shift ;;
     --disable-github)    ENABLE_GITHUB=false; shift ;;
+    --enable-github-mcp) ENABLE_GITHUB_MCP=true; shift ;;
+    --mcp-port)
+      [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1024 && $2 <= 65535 )) || { echo "❌ --mcp-port: invalid port '$2' (1024-65535)"; exit 1; }
+      PORT_MCP=$2; shift 2 ;;
     --mem-limit)
       [[ "$2" =~ ^[0-9]+[KMG]$ ]] || { echo "❌ --mem-limit: invalid value '$2' (e.g. 4G, 512M)"; exit 1; }
       MEM_LIMIT=$2; shift 2 ;;
@@ -119,7 +128,11 @@ OPTIONS:
   --workdir DIR          Working directory to mount read-write (default: CWD).
                          Must be an existing path; symlinks are resolved.
   --sandbox-home DIR     Copy files from DIR into the sandbox home at startup.
-  --enable-github        Enable GitHub access via CONNECT proxy (requires GH_TOKEN on host).
+  --enable-github-mcp    Enable GitHub access via MCP server (recommended; requires GH_TOKEN
+                         and github-mcp-server binary on host).
+  --mcp-port PORT        TCP port for MCP server bridge (default: 58082; range 1024-65535).
+  --enable-github        Enable GitHub access via CONNECT proxy + gh CLI (unrecommended;
+                         use --enable-github-mcp instead). Requires GH_TOKEN on host.
   --mem-limit SIZE       Memory limit (e.g. 4G, 512M). Uses cgroups via systemd-run.
   --cpu-limit PERCENT    CPU limit as percentage (100 = 1 core, 200 = 2 cores).
   --idle-timeout MINS    Warn when no Anthropic API request for MINS minutes (default: 15, 0=off).
@@ -185,6 +198,8 @@ fi
 # ---------------------------------------------------------------------------
 [[ "$PORT_ANTHROPIC" -ne "$PORT_GITHUB_CONNECT" ]] || {
   echo "❌ --anthropic-port and --github-port must be different"; exit 1; }
+[[ "$PORT_ANTHROPIC" -ne "$PORT_MCP" && "$PORT_GITHUB_CONNECT" -ne "$PORT_MCP" ]] || {
+  echo "❌ --mcp-port must differ from --anthropic-port and --github-port"; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Validate and canonicalise workdir (HIGH-4: symlink/path traversal)
@@ -200,7 +215,8 @@ WORKDIR=$(realpath --canonicalize-existing "$WORKDIR" 2>/dev/null) || {
 cleanup() {
   local code=$?
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
-  rm -f "$SOCKET_ANTHROPIC" "$SOCKET_GITHUB" 2>/dev/null || true
+  [[ -n "$MCP_SERVER_PID" ]] && kill "$MCP_SERVER_PID" 2>/dev/null || true
+  rm -f "$SOCKET_ANTHROPIC" "$SOCKET_GITHUB" "$SOCKET_MCP" 2>/dev/null || true
   rm -rf "$ATTACH_DIR" 2>/dev/null || true
   [[ -n "$TEMP_CREDS" && -f "$TEMP_CREDS" && -z "$DUMMY_CREDS_FILE" ]] && rm -f "$TEMP_CREDS" || true
   exit $code
@@ -282,6 +298,24 @@ if [[ "$ISOLATE_NET" == false ]]; then
   PROXY_ARGS+=(--github-connect-port "$PORT_GITHUB_CONNECT")
 fi
 [[ "$ENABLE_GITHUB" == true ]] && PROXY_ARGS+=(--enable-github)
+
+# GitHub MCP server: start on host, add reverse bridge args to proxy
+if [[ "$ENABLE_GITHUB_MCP" == true ]]; then
+  [[ -n "${GH_TOKEN:-}" ]] || { echo "❌ --enable-github-mcp requires GH_TOKEN to be set on the host"; exit 1; }
+  command -v github-mcp-server >/dev/null 2>&1 || { echo "❌ github-mcp-server not found (install from https://github.com/github/github-mcp-server)"; exit 1; }
+  echo "▶ Starting GitHub MCP server (HTTP mode, port $PORT_MCP)"
+  GITHUB_PERSONAL_ACCESS_TOKEN="$GH_TOKEN" github-mcp-server http --port "$PORT_MCP" &
+  MCP_SERVER_PID=$!
+  # Wait for MCP server to be ready
+  for _i in $(seq 1 30); do
+    (echo >/dev/tcp/127.0.0.1/"$PORT_MCP") 2>/dev/null && break || true
+    sleep 0.2
+    kill -0 "$MCP_SERVER_PID" 2>/dev/null || { echo "❌ GitHub MCP server died"; exit 1; }
+  done
+  (echo >/dev/tcp/127.0.0.1/"$PORT_MCP") 2>/dev/null || { echo "❌ GitHub MCP server did not start"; exit 1; }
+  echo "✔ GitHub MCP server ready (port $PORT_MCP)"
+  PROXY_ARGS+=(--mcp-bridge-socket "$SOCKET_MCP" --mcp-bridge-port "$PORT_MCP")
+fi
 [[ "$IDLE_TIMEOUT" -gt 0 ]] && PROXY_ARGS+=(--idle-timeout "$IDLE_TIMEOUT")
 [[ -n "$NOTIFY_COMMAND" ]] && PROXY_ARGS+=(--notify-command "$NOTIFY_COMMAND")
 [[ -n "$NOTIFY_WEBHOOK" ]] && PROXY_ARGS+=(--notify-webhook "$NOTIFY_WEBHOOK")
@@ -289,14 +323,22 @@ fi
 node "$PROXY_SCRIPT" "${PROXY_ARGS[@]}" &
 PROXY_PID=$!
 
+_wait_sockets() {
+  [[ -S "$SOCKET_ANTHROPIC" ]] || return 1
+  [[ -S "$SOCKET_GITHUB" ]] || return 1
+  [[ "$ENABLE_GITHUB_MCP" == true ]] && { [[ -S "$SOCKET_MCP" ]] || return 1; }
+  return 0
+}
 for _i in $(seq 1 25); do
-  [[ -S "$SOCKET_ANTHROPIC" && -S "$SOCKET_GITHUB" ]] && break
+  _wait_sockets && break
   sleep 0.2
   kill -0 "$PROXY_PID" 2>/dev/null || { echo "❌ Proxy process died"; exit 1; }
 done
 [[ -S "$SOCKET_ANTHROPIC" ]] || { echo "❌ Anthropic proxy socket did not appear"; exit 1; }
 [[ -S "$SOCKET_GITHUB" ]]    || { echo "❌ GitHub proxy socket did not appear"; exit 1; }
+[[ "$ENABLE_GITHUB_MCP" == true ]] && { [[ -S "$SOCKET_MCP" ]] || { echo "❌ MCP bridge socket did not appear"; exit 1; }; }
 _gh_desc="none"; [[ "$ENABLE_GITHUB" == true ]] && _gh_desc="api.github.com"
+[[ "$ENABLE_GITHUB_MCP" == true ]] && _gh_desc="${_gh_desc}+mcp"
 echo "✔ Proxy ready (anthropic=$SOCKET_ANTHROPIC, github=$SOCKET_GITHUB, allowlist=$_gh_desc)"
 
 # ---------------------------------------------------------------------------
@@ -469,6 +511,16 @@ if [[ "$ENABLE_GITHUB" == true ]]; then
   )
 fi
 
+# GitHub MCP server: bind-mount the reverse bridge socket and pass config vars
+if [[ "$ENABLE_GITHUB_MCP" == true ]]; then
+  BWRAP+=(
+    --ro-bind "$SOCKET_MCP" "$SANDBOX_SOCKET_MCP"
+    --setenv _MCP_SOCK "$SANDBOX_SOCKET_MCP"
+    --setenv _MCP_PORT "$PORT_MCP"
+    --setenv _ENABLE_GITHUB_MCP "true"
+  )
+fi
+
 # ~/.claude sharing
 if [[ "$SHARE_CLAUDE_DIR" == true && -d "$HOME/.claude" ]]; then
   BWRAP+=(--ro-bind "$HOME/.claude" "$SANDBOX_HOME/.claude")
@@ -634,11 +686,41 @@ SANDBOX_INIT_SCRIPT='
       EXEC:"bash -li",pty,stderr,setsid,sigint,sane &
   fi
 
+  # GitHub MCP server bridge (reverse bridge socket → in-sandbox TCP)
+  if [[ "${_ENABLE_GITHUB_MCP:-}" == true ]]; then
+    if [[ "$_ISOLATE_NET" == true ]]; then
+      if command -v node >/dev/null 2>&1 && [[ -f /run/credential-proxy.js ]]; then
+        node /run/credential-proxy.js --bridge-only \
+          --socket "$_MCP_SOCK" --tcp-bridge-port "$_MCP_PORT" &
+        for _i in $(seq 1 20); do
+          (echo >/dev/tcp/127.0.0.1/"$_MCP_PORT") 2>/dev/null && break || true
+          sleep 0.1
+        done
+      elif command -v socat >/dev/null 2>&1; then
+        socat TCP-LISTEN:"$_MCP_PORT",fork,reuseaddr UNIX-CLIENT:"$_MCP_SOCK" &
+        sleep 0.3
+      fi
+    fi
+    # Write MCP server config for Claude Code (streamable-http transport)
+    mkdir -p "$HOME/.claude"
+    cat > "$HOME/.claude/settings.local.json" <<MCPEOF
+{
+  "mcpServers": {
+    "github": {
+      "type": "url",
+      "url": "http://127.0.0.1:${_MCP_PORT}/mcp"
+    }
+  }
+}
+MCPEOF
+    echo "✔ GitHub MCP server configured (port $_MCP_PORT)"
+  fi
+
   echo "✔ Sandbox ready  ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL"
 
   # Save _LAUNCH_SHELL before cleaning up internal init vars.
   _ls="$_LAUNCH_SHELL"
-  unset _PROXY_SOCK _PROXY_PORT _GITHUB_SOCK _GITHUB_PORT _ISOLATE_NET _ENABLE_GITHUB _LAUNCH_SHELL
+  unset _PROXY_SOCK _PROXY_PORT _GITHUB_SOCK _GITHUB_PORT _ISOLATE_NET _ENABLE_GITHUB _LAUNCH_SHELL _ENABLE_GITHUB_MCP _MCP_SOCK _MCP_PORT
 
   if [[ "$_ls" == true ]]; then
     exec bash
