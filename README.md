@@ -122,6 +122,8 @@ GH_TOKEN=ghp_xxx ./claudebox.sh \
 --mem-limit SIZE       Memory limit, e.g. 4G, 512M (uses cgroups via systemd-run).
 --cpu-limit PERCENT    CPU limit as percentage: 100 = 1 core, 200 = 2 cores, etc.
 --idle-timeout MINS    Warn when no Anthropic API request for MINS minutes (default: 15, 0=off).
+--notify-webhook URL   POST JSON on events (Slack incoming webhook compatible).
+--notify-command CMD   Run CMD on events (env: CLAUDEBOX_EVENT, CLAUDEBOX_MESSAGE).
 --anthropic-port PORT  TCP port for Anthropic proxy bridge (default: 58080).
 --github-port PORT     TCP port for GitHub CONNECT proxy bridge (default: 58081).
 --help                 Show help.
@@ -256,6 +258,64 @@ This helps detect stuck processes or forgotten sandboxes.
 ```
 
 The warning is printed once per idle period. It resets when the next API request arrives.
+
+## Notifications
+
+Receive notifications on sandbox events via a webhook URL or a custom command.
+
+**Events**: `sandbox_start`, `sandbox_exit`, `oom_kill`, `idle_timeout`
+
+### Slack Incoming Webhook (simplest)
+
+```bash
+./claudebox.sh \
+  --notify-webhook https://hooks.slack.com/services/T.../B.../xxx \
+  --workdir ~/projects/myapp
+```
+
+`--notify-webhook` POSTs Slack-compatible JSON (`text` + `blocks`) on every event.
+
+### Custom Command
+
+```bash
+./claudebox.sh \
+  --notify-command './examples/notify-slack.sh' \
+  --workdir ~/projects/myapp
+```
+
+The command receives event details via environment variables:
+
+| Variable | Description |
+|---|---|
+| `CLAUDEBOX_EVENT` | Event type (`sandbox_start`, `sandbox_exit`, `oom_kill`, `idle_timeout`) |
+| `CLAUDEBOX_MESSAGE` | Human-readable message (Slack mrkdwn format) |
+| `CLAUDEBOX_WORKDIR` | Sandbox workdir path |
+| `CLAUDEBOX_PID` | Sandbox launcher PID |
+
+### Example: Desktop notification
+
+```bash
+./claudebox.sh \
+  --notify-command 'notify-send "claudebox [$CLAUDEBOX_EVENT]" "$CLAUDEBOX_MESSAGE"'
+```
+
+### Example: Log to file
+
+```bash
+./claudebox.sh \
+  --notify-command 'echo "$(date -Iseconds) $CLAUDEBOX_EVENT: $CLAUDEBOX_MESSAGE" >> /tmp/claudebox.log'
+```
+
+### Both at once
+
+```bash
+./claudebox.sh \
+  --notify-webhook https://hooks.slack.com/services/T.../B.../xxx \
+  --notify-command 'notify-send "claudebox" "$CLAUDEBOX_MESSAGE"'
+```
+
+See `examples/notify-slack.sh` for a full Slack notification script with color-coded
+attachments per event type.
 
 ## Sandbox Security Properties
 

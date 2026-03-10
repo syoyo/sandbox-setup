@@ -62,6 +62,8 @@ MEM_LIMIT=""           # e.g. 4G, 8G, 512M
 CPU_LIMIT=""           # percentage: 100 = 1 core, 200 = 2 cores
 IDLE_TIMEOUT=15        # minutes: warn if no Anthropic request for this long (0=disable)
 ATTACH_MODE=false      # --attach: connect to existing sandbox
+NOTIFY_COMMAND=""      # shell command for event notifications
+NOTIFY_WEBHOOK=""      # webhook URL for event notifications (Slack, etc.)
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -88,6 +90,8 @@ while [[ $# -gt 0 ]]; do
       [[ "$2" =~ ^[0-9]+$ ]] || { echo "❌ --idle-timeout: invalid value '$2' (minutes)"; exit 1; }
       IDLE_TIMEOUT=$2; shift 2 ;;
     --attach)  ATTACH_MODE=true; shift ;;
+    --notify-command)  NOTIFY_COMMAND=$2; shift 2 ;;
+    --notify-webhook)  NOTIFY_WEBHOOK=$2; shift 2 ;;
     --anthropic-port)
       [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1024 && $2 <= 65535 )) || { echo "❌ --anthropic-port: invalid port '$2' (1024-65535)"; exit 1; }
       PORT_ANTHROPIC=$2; shift 2 ;;
@@ -120,6 +124,8 @@ OPTIONS:
   --cpu-limit PERCENT    CPU limit as percentage (100 = 1 core, 200 = 2 cores).
   --idle-timeout MINS    Warn when no Anthropic API request for MINS minutes (default: 15, 0=off).
   --attach               Attach to an existing sandbox (connect to its shell socket).
+  --notify-command CMD   Run CMD on events (env: CLAUDEBOX_EVENT, CLAUDEBOX_MESSAGE).
+  --notify-webhook URL   POST JSON to URL on events (Slack incoming webhook compatible).
   --anthropic-port PORT  TCP port for Anthropic proxy bridge (default: 58080; range 1024-65535)
   --github-port PORT     TCP port for GitHub CONNECT proxy (default: 58081; range 1024-65535)
   --help                 Show this help
@@ -202,6 +208,41 @@ cleanup() {
 trap cleanup INT TERM EXIT
 
 # ---------------------------------------------------------------------------
+# Notification helper — sends events to --notify-command and/or --notify-webhook
+# Usage: notify EVENT_TYPE "message text"
+# Events: sandbox_start, sandbox_exit, oom_kill, idle_timeout
+# ---------------------------------------------------------------------------
+notify() {
+  local event="$1" message="$2"
+
+  if [[ -n "$NOTIFY_COMMAND" ]]; then
+    CLAUDEBOX_EVENT="$event" CLAUDEBOX_MESSAGE="$message" \
+    CLAUDEBOX_WORKDIR="$WORKDIR" CLAUDEBOX_PID="$$" \
+      bash -c "$NOTIFY_COMMAND" &>/dev/null &
+  fi
+
+  if [[ -n "$NOTIFY_WEBHOOK" ]]; then
+    local json
+    json=$(node -e "
+      console.log(JSON.stringify({
+        text: process.argv[1],
+        blocks: [{
+          type: 'section',
+          text: { type: 'mrkdwn', text: process.argv[1] }
+        }],
+        // Extra fields for non-Slack webhooks
+        event: process.argv[2],
+        workdir: process.argv[3],
+        pid: process.argv[4],
+        timestamp: new Date().toISOString()
+      }));
+    " "$message" "$event" "$WORKDIR" "$$" 2>/dev/null)
+    curl -s -X POST -H 'Content-Type: application/json' \
+      -d "$json" "$NOTIFY_WEBHOOK" &>/dev/null &
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Sanity checks
 # ---------------------------------------------------------------------------
 command -v bwrap >/dev/null 2>&1 || { echo "❌ bwrap not found (install bubblewrap)"; exit 1; }
@@ -242,6 +283,8 @@ if [[ "$ISOLATE_NET" == false ]]; then
 fi
 [[ "$ENABLE_GITHUB" == true ]] && PROXY_ARGS+=(--enable-github)
 [[ "$IDLE_TIMEOUT" -gt 0 ]] && PROXY_ARGS+=(--idle-timeout "$IDLE_TIMEOUT")
+[[ -n "$NOTIFY_COMMAND" ]] && PROXY_ARGS+=(--notify-command "$NOTIFY_COMMAND")
+[[ -n "$NOTIFY_WEBHOOK" ]] && PROXY_ARGS+=(--notify-webhook "$NOTIFY_WEBHOOK")
 
 node "$PROXY_SCRIPT" "${PROXY_ARGS[@]}" &
 PROXY_PID=$!
@@ -527,6 +570,7 @@ oom_check() {
     echo ""
     echo "⚠ SANDBOX OOM KILLED — memory limit ($MEM_LIMIT) exceeded (exit code: $exit_code)"
     echo "  Increase with --mem-limit or reduce sandbox workload."
+    notify oom_kill ":warning: Sandbox OOM killed — memory limit ($MEM_LIMIT) exceeded (exit code: $exit_code)"
   fi
 }
 
@@ -540,6 +584,7 @@ NET_DESC="$([[ "$ISOLATE_NET" == true ]] && echo "isolated (loopback + socket br
 echo "▶ Launching sandbox (workdir: $WORKDIR, network: $NET_DESC)"
 echo "  Attach from another terminal: $0 --attach"
 echo "  Attach socket: $ATTACH_SOCK"
+notify sandbox_start ":rocket: Sandbox started — workdir: \`$(basename "$WORKDIR")\`, network: $NET_DESC, PID: $$"
 
 SANDBOX_INIT_SCRIPT='
   set -euo pipefail
@@ -612,7 +657,11 @@ if [[ ${#RESOURCE_WRAPPER[@]} -gt 0 ]]; then
   wait $SANDBOX_PID 2>/dev/null
   SANDBOX_EXIT=$?
   oom_check $SANDBOX_EXIT
+  notify sandbox_exit ":stop_sign: Sandbox exited (code: $SANDBOX_EXIT, workdir: \`$(basename "$WORKDIR")\`)"
   exit $SANDBOX_EXIT
 else
   "${BWRAP[@]}" -- bash -c "$SANDBOX_INIT_SCRIPT" -- "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}"
+  SANDBOX_EXIT=$?
+  notify sandbox_exit ":stop_sign: Sandbox exited (code: $SANDBOX_EXIT, workdir: \`$(basename "$WORKDIR")\`)"
+  exit $SANDBOX_EXIT
 fi

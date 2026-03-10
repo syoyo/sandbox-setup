@@ -32,7 +32,7 @@ const fs    = require('fs');
 const os    = require('os');
 const path  = require('path');
 const url   = require('url');
-const { spawnSync } = require('child_process');
+const { spawnSync, spawn } = require('child_process');
 
 // ---------------------------------------------------------------------------
 // Dummy token placed in the sandbox by claudebox.sh.
@@ -70,6 +70,8 @@ function parseArgs(argv) {
     githubSocket:      null,
     enableGithub:      false,
     idleTimeout:       0,       // minutes; 0 = disabled
+    notifyCommand:     null,
+    notifyWebhook:     null,
     bridgeOnly:        false,
     bridgeSocket:      null,
     bridgeTcpPort:     null,
@@ -83,6 +85,8 @@ function parseArgs(argv) {
       case '--github-connect-port': args.githubConnectPort = parseInt(argv[++i], 10); break;
       case '--github-socket':        args.githubSocket  = argv[++i]; break;
       case '--idle-timeout':        args.idleTimeout   = parseInt(argv[++i], 10); break;
+      case '--notify-command':     args.notifyCommand = argv[++i]; break;
+      case '--notify-webhook':     args.notifyWebhook = argv[++i]; break;
       case '--enable-github':       args.enableGithub = true; break;
       case '--bridge-only':         args.bridgeOnly = true; break;
       case '--socket':              args.bridgeSocket  = argv[++i]; break;
@@ -188,6 +192,35 @@ function invalidateCache() { _credsCache = null; }
 let _lastRequestTime = Date.now();
 function touchActivity() { _lastRequestTime = Date.now(); }
 function getLastRequestTime() { return _lastRequestTime; }
+
+// ---------------------------------------------------------------------------
+// Notification helper — sends events via command and/or webhook
+// ---------------------------------------------------------------------------
+function sendNotification(event, message, notifyCommand, notifyWebhook) {
+  if (notifyCommand) {
+    const child = spawn('bash', ['-c', notifyCommand], {
+      env: { ...process.env, CLAUDEBOX_EVENT: event, CLAUDEBOX_MESSAGE: message },
+      stdio: 'ignore', detached: true,
+    });
+    child.unref();
+  }
+  if (notifyWebhook) {
+    const payload = JSON.stringify({
+      text: message,
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: message } }],
+      event, timestamp: new Date().toISOString(),
+    });
+    const u = new URL(notifyWebhook);
+    const reqOpts = {
+      hostname: u.hostname, port: u.port || 443, path: u.pathname + u.search,
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+    };
+    const mod = u.protocol === 'https:' ? https : http;
+    const req = mod.request(reqOpts, (res) => res.resume());
+    req.on('error', () => {});
+    req.end(payload);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Anthropic proxy request handling
@@ -501,8 +534,10 @@ if (args.bridgeOnly) {
       if (elapsed >= idleMs) {
         if (!_idleWarned) {
           const mins = Math.round(elapsed / 60000);
+          const msg = `:hourglass: No Anthropic API request for ${mins} minutes (threshold: ${args.idleTimeout}m). Sandbox may be stuck or idle.`;
           console.warn(`[idle] ⚠ No Anthropic API request for ${mins} minutes (threshold: ${args.idleTimeout}m)`);
           console.warn('[idle]   The sandbox process may be stuck or idle.');
+          sendNotification('idle_timeout', msg, args.notifyCommand, args.notifyWebhook);
           _idleWarned = true;
         }
       } else {
