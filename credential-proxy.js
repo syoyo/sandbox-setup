@@ -69,6 +69,7 @@ function parseArgs(argv) {
     githubConnectPort: null,
     githubSocket:      null,
     enableGithub:      false,
+    idleTimeout:       0,       // minutes; 0 = disabled
     bridgeOnly:        false,
     bridgeSocket:      null,
     bridgeTcpPort:     null,
@@ -81,6 +82,7 @@ function parseArgs(argv) {
       case '--anthropic-tcp-port':  args.anthropicTcpPort  = parseInt(argv[++i], 10); break;
       case '--github-connect-port': args.githubConnectPort = parseInt(argv[++i], 10); break;
       case '--github-socket':        args.githubSocket  = argv[++i]; break;
+      case '--idle-timeout':        args.idleTimeout   = parseInt(argv[++i], 10); break;
       case '--enable-github':       args.enableGithub = true; break;
       case '--bridge-only':         args.bridgeOnly = true; break;
       case '--socket':              args.bridgeSocket  = argv[++i]; break;
@@ -181,6 +183,13 @@ function getAccessToken() {
 function invalidateCache() { _credsCache = null; }
 
 // ---------------------------------------------------------------------------
+// Idle tracking — updated on every Anthropic API request
+// ---------------------------------------------------------------------------
+let _lastRequestTime = Date.now();
+function touchActivity() { _lastRequestTime = Date.now(); }
+function getLastRequestTime() { return _lastRequestTime; }
+
+// ---------------------------------------------------------------------------
 // Anthropic proxy request handling
 // ---------------------------------------------------------------------------
 
@@ -271,6 +280,7 @@ function createHandler(verbose) {
 
     // Use normalized path for forwarding.
     const forwardUrl = normalizedPath + parsed.search;
+    touchActivity();
 
     const chunks = [];
     let bodyLen = 0;
@@ -481,6 +491,26 @@ if (args.bridgeOnly) {
   };
   process.on('SIGINT', cleanup);
   process.on('SIGTERM', cleanup);
+
+  // Idle timeout monitor — warn when no Anthropic requests for N minutes
+  if (args.idleTimeout > 0) {
+    const idleMs = args.idleTimeout * 60 * 1000;
+    let _idleWarned = false;
+    setInterval(() => {
+      const elapsed = Date.now() - getLastRequestTime();
+      if (elapsed >= idleMs) {
+        if (!_idleWarned) {
+          const mins = Math.round(elapsed / 60000);
+          console.warn(`[idle] ⚠ No Anthropic API request for ${mins} minutes (threshold: ${args.idleTimeout}m)`);
+          console.warn('[idle]   The sandbox process may be stuck or idle.');
+          _idleWarned = true;
+        }
+      } else {
+        _idleWarned = false;
+      }
+    }, 60_000); // check every minute
+    console.log(`[idle] Idle timeout: ${args.idleTimeout} minutes`);
+  }
 
   console.log('[anthropic] Credential sources: CLAUDE_CREDENTIALS_FILE → macOS Keychain → ~/.claude/.credentials.json');
   console.log('[anthropic] Path allowlist:', ANTHROPIC_PATH_ALLOWLIST.toString());

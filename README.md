@@ -110,6 +110,7 @@ GH_TOKEN=ghp_xxx ./claudebox.sh \
 --workdir DIR          Working directory to mount read-write (default: CWD).
                        Symlinks are resolved. Cannot be / or $HOME.
 --shell                Launch bash instead of claude (useful for debugging).
+--attach               Attach to a running sandbox from another terminal.
 --mount-claude-md      Mount ~/.claude/CLAUDE.md into sandbox (read-only).
 --share-claude-dir     Mount entire ~/.claude read-only (credentials replaced with dummies).
 --sandbox-home DIR     Copy files from DIR into sandbox home at startup.
@@ -120,6 +121,7 @@ GH_TOKEN=ghp_xxx ./claudebox.sh \
 --dummy-credentials F  Use FILE as the dummy .credentials.json.
 --mem-limit SIZE       Memory limit, e.g. 4G, 512M (uses cgroups via systemd-run).
 --cpu-limit PERCENT    CPU limit as percentage: 100 = 1 core, 200 = 2 cores, etc.
+--idle-timeout MINS    Warn when no Anthropic API request for MINS minutes (default: 15, 0=off).
 --anthropic-port PORT  TCP port for Anthropic proxy bridge (default: 58080).
 --github-port PORT     TCP port for GitHub CONNECT proxy bridge (default: 58081).
 --help                 Show help.
@@ -206,6 +208,54 @@ and prints:
 **Important**: The OOM killer targets individual processes, not the entire sandbox.
 A single process exceeding the limit will be killed, but the sandbox shell remains
 operational. This is standard Linux cgroup v2 behavior.
+
+## Attaching to a Running Sandbox
+
+Each sandbox starts a `socat` listener on a Unix socket that provides shell access.
+This allows you to inspect, debug, or interact with a running sandbox from another terminal.
+
+```bash
+# Terminal 1: start sandbox
+./claudebox.sh --workdir ~/projects/myapp
+
+# Terminal 2: attach to it
+./claudebox.sh --attach
+```
+
+`--attach` finds the most recent sandbox's attach socket and connects to it.
+You can also connect directly:
+
+```bash
+socat -,raw,echo=0 UNIX-CONNECT:/run/user/1000/claudebox-attach-PID/shell.sock
+```
+
+The attach socket is in `$XDG_RUNTIME_DIR/claudebox-attach-PID/` (mode 700, user-private).
+Multiple attach sessions can connect simultaneously. The socket is cleaned up when the
+sandbox exits.
+
+**Requires**: `socat` installed in the sandbox (usually available via the system `/usr/bin`).
+
+## Idle Timeout
+
+The host-side proxy monitors Anthropic API activity. If no request is received for a
+configurable period (default: 15 minutes), a warning is printed to the host's stderr:
+
+```
+[idle] ⚠ No Anthropic API request for 15 minutes (threshold: 15m)
+[idle]   The sandbox process may be stuck or idle.
+```
+
+This helps detect stuck processes or forgotten sandboxes.
+
+```bash
+# Custom timeout (5 minutes)
+./claudebox.sh --idle-timeout 5
+
+# Disable idle timeout
+./claudebox.sh --idle-timeout 0
+```
+
+The warning is printed once per idle period. It resets when the next API request arrives.
 
 ## Sandbox Security Properties
 

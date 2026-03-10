@@ -60,6 +60,8 @@ DUMMY_CREDS_FILE=""
 SANDBOX_HOME_SEED=""
 MEM_LIMIT=""           # e.g. 4G, 8G, 512M
 CPU_LIMIT=""           # percentage: 100 = 1 core, 200 = 2 cores
+IDLE_TIMEOUT=15        # minutes: warn if no Anthropic request for this long (0=disable)
+ATTACH_MODE=false      # --attach: connect to existing sandbox
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -82,6 +84,10 @@ while [[ $# -gt 0 ]]; do
     --cpu-limit)
       [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1 && $2 <= 100000 )) || { echo "❌ --cpu-limit: invalid value '$2' (percentage, e.g. 200 = 2 cores)"; exit 1; }
       CPU_LIMIT=$2; shift 2 ;;
+    --idle-timeout)
+      [[ "$2" =~ ^[0-9]+$ ]] || { echo "❌ --idle-timeout: invalid value '$2' (minutes)"; exit 1; }
+      IDLE_TIMEOUT=$2; shift 2 ;;
+    --attach)  ATTACH_MODE=true; shift ;;
     --anthropic-port)
       [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1024 && $2 <= 65535 )) || { echo "❌ --anthropic-port: invalid port '$2' (1024-65535)"; exit 1; }
       PORT_ANTHROPIC=$2; shift 2 ;;
@@ -112,6 +118,8 @@ OPTIONS:
   --enable-github        Enable GitHub access via CONNECT proxy (requires GH_TOKEN on host).
   --mem-limit SIZE       Memory limit (e.g. 4G, 512M). Uses cgroups via systemd-run.
   --cpu-limit PERCENT    CPU limit as percentage (100 = 1 core, 200 = 2 cores).
+  --idle-timeout MINS    Warn when no Anthropic API request for MINS minutes (default: 15, 0=off).
+  --attach               Attach to an existing sandbox (connect to its shell socket).
   --anthropic-port PORT  TCP port for Anthropic proxy bridge (default: 58080; range 1024-65535)
   --github-port PORT     TCP port for GitHub CONNECT proxy (default: 58081; range 1024-65535)
   --help                 Show this help
@@ -142,6 +150,31 @@ EOF
 done
 
 # ---------------------------------------------------------------------------
+# Attach socket directory (shared between host and sandbox for shell access)
+# ---------------------------------------------------------------------------
+ATTACH_DIR="$_SOCK_DIR/claudebox-attach-$$"
+ATTACH_SOCK="$ATTACH_DIR/shell.sock"
+
+# ---------------------------------------------------------------------------
+# --attach: connect to an existing sandbox's shell socket
+# ---------------------------------------------------------------------------
+if [[ "$ATTACH_MODE" == true ]]; then
+  # Find the most recent attach socket
+  _found_sock=""
+  for _d in "$_SOCK_DIR"/claudebox-attach-*/shell.sock; do
+    [[ -S "$_d" ]] && _found_sock="$_d"
+  done
+  if [[ -z "$_found_sock" ]]; then
+    echo "❌ No running sandbox found (no attach socket in $_SOCK_DIR/claudebox-attach-*/)"
+    echo "   Tip: list available sockets with: ls $_SOCK_DIR/claudebox-attach-*/shell.sock"
+    exit 1
+  fi
+  echo "▶ Attaching to sandbox: $_found_sock"
+  echo "  (Ctrl-C to detach)"
+  exec socat -,raw,echo=0 UNIX-CONNECT:"$_found_sock"
+fi
+
+# ---------------------------------------------------------------------------
 # Validate ports don't collide
 # ---------------------------------------------------------------------------
 [[ "$PORT_ANTHROPIC" -ne "$PORT_GITHUB_CONNECT" ]] || {
@@ -162,6 +195,7 @@ cleanup() {
   local code=$?
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
   rm -f "$SOCKET_ANTHROPIC" "$SOCKET_GITHUB" 2>/dev/null || true
+  rm -rf "$ATTACH_DIR" 2>/dev/null || true
   [[ -n "$TEMP_CREDS" && -f "$TEMP_CREDS" && -z "$DUMMY_CREDS_FILE" ]] && rm -f "$TEMP_CREDS" || true
   exit $code
 }
@@ -207,6 +241,7 @@ if [[ "$ISOLATE_NET" == false ]]; then
   PROXY_ARGS+=(--github-connect-port "$PORT_GITHUB_CONNECT")
 fi
 [[ "$ENABLE_GITHUB" == true ]] && PROXY_ARGS+=(--enable-github)
+[[ "$IDLE_TIMEOUT" -gt 0 ]] && PROXY_ARGS+=(--idle-timeout "$IDLE_TIMEOUT")
 
 node "$PROXY_SCRIPT" "${PROXY_ARGS[@]}" &
 PROXY_PID=$!
@@ -284,6 +319,10 @@ system_dir_args() {
   printf '%s\0' "${args[@]}"
 }
 
+# Create attach socket directory (host-side, bind-mounted rw into sandbox)
+mkdir -p "$ATTACH_DIR"
+chmod 700 "$ATTACH_DIR"
+
 mapfile -d '' SYS_ARGS < <(system_dir_args)
 
 BWRAP=(
@@ -345,6 +384,9 @@ BWRAP=(
   # MED-3: bind credential-proxy.js from SCRIPT_DIR (read-only) so the in-sandbox
   # bridge cannot be replaced by a tampered copy in the writable workspace.
   --ro-bind "$PROXY_SCRIPT" /run/credential-proxy.js
+
+  # ---- Attach socket directory (rw — socat creates the socket here) ----
+  --bind "$ATTACH_DIR" /run/attach
 
   # ---- Environment ----
   --clearenv
@@ -496,6 +538,8 @@ oom_check() {
 # ---------------------------------------------------------------------------
 NET_DESC="$([[ "$ISOLATE_NET" == true ]] && echo "isolated (loopback + socket bridges)" || echo "shared host network")"
 echo "▶ Launching sandbox (workdir: $WORKDIR, network: $NET_DESC)"
+echo "  Attach from another terminal: $0 --attach"
+echo "  Attach socket: $ATTACH_SOCK"
 
 SANDBOX_INIT_SCRIPT='
   set -euo pipefail
@@ -537,6 +581,12 @@ SANDBOX_INIT_SCRIPT='
       echo "❌ need node or socat for in-sandbox bridge"
       exit 1
     fi
+  fi
+
+  # Start attach shell listener (socat) for external access via --attach
+  if command -v socat >/dev/null 2>&1; then
+    socat UNIX-LISTEN:/run/attach/shell.sock,fork,mode=600 \
+      EXEC:"bash -li",pty,stderr,setsid,sigint,sane &
   fi
 
   echo "✔ Sandbox ready  ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL"
