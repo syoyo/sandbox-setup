@@ -72,8 +72,9 @@ function parseArgs(argv) {
     idleTimeout:       0,       // minutes; 0 = disabled
     notifyCommand:     null,
     notifyWebhook:     null,
-    mcpBridgeSocket:   null,   // Unix socket for reverse bridge to MCP server
+    mcpBridgeSocket:   null,   // Unix socket for MCP auth proxy
     mcpBridgePort:     null,   // target TCP port of MCP server on localhost
+    mcpBearerToken:    null,   // Bearer token to inject into MCP requests
     bridgeOnly:        false,
     bridgeSocket:      null,
     bridgeTcpPort:     null,
@@ -91,6 +92,7 @@ function parseArgs(argv) {
       case '--notify-webhook':     args.notifyWebhook = argv[++i]; break;
       case '--mcp-bridge-socket':  args.mcpBridgeSocket = argv[++i]; break;
       case '--mcp-bridge-port':    args.mcpBridgePort = parseInt(argv[++i], 10); break;
+      case '--mcp-bearer-token':   args.mcpBearerToken = argv[++i]; break;
       case '--enable-github':       args.enableGithub = true; break;
       case '--bridge-only':         args.bridgeOnly = true; break;
       case '--socket':              args.bridgeSocket  = argv[++i]; break;
@@ -379,24 +381,40 @@ function startTcpBridge(socketPath, port, label) {
 }
 
 // ---------------------------------------------------------------------------
-// Reverse TCP bridge: Unix socket → TCP (for host-side services like MCP server)
+// MCP auth-injecting HTTP proxy: Unix socket → localhost MCP server
+// Injects Authorization: Bearer <token> into every request so the sandbox
+// never sees the real GitHub token.
 // ---------------------------------------------------------------------------
 
-function startReverseBridge(targetPort, socketPath, label) {
-  const tag = `[${label ?? 'reverse-bridge'}]`;
+function startMcpAuthProxy(targetPort, socketPath, bearerToken) {
+  const tag = '[mcp-proxy]';
   if (fs.existsSync(socketPath)) fs.unlinkSync(socketPath);
-  const server = net.createServer((unix) => {
-    const tcp = net.createConnection(targetPort, '127.0.0.1');
-    unix.pipe(tcp);
-    tcp.pipe(unix);
-    const cleanup = () => { unix.destroy(); tcp.destroy(); };
-    unix.on('error', cleanup);
-    tcp.on('error', (err) => { console.error(`${tag} tcp error:`, err.message); cleanup(); });
-    unix.on('close', cleanup);
-    tcp.on('close', cleanup);
+
+  const server = http.createServer((req, res) => {
+    const opts = {
+      hostname: '127.0.0.1',
+      port: targetPort,
+      path: req.url,
+      method: req.method,
+      headers: { ...req.headers, authorization: `Bearer ${bearerToken}` },
+    };
+    // Remove host header to avoid confusion on upstream
+    delete opts.headers.host;
+
+    const upstream = http.request(opts, (upRes) => {
+      res.writeHead(upRes.statusCode, upRes.headers);
+      upRes.pipe(res);
+    });
+    upstream.on('error', (err) => {
+      console.error(`${tag} upstream error:`, err.message);
+      if (!res.headersSent) res.writeHead(502);
+      res.end('Bad Gateway');
+    });
+    req.pipe(upstream);
   });
+
   server.listen(socketPath, () =>
-    console.log(`${tag} Unix ${socketPath} → TCP 127.0.0.1:${targetPort}`));
+    console.log(`${tag} Unix ${socketPath} → HTTP 127.0.0.1:${targetPort} (auth injected)`));
   server.on('error', (err) => { console.error(`${tag} error:`, err.message); process.exit(1); });
   return server;
 }
@@ -544,11 +562,11 @@ if (args.bridgeOnly) {
     startConnectProxySocket(githubSocketPath, allowlist, args.verbose);
   }
 
-  // Reverse bridge for MCP server (Unix socket → TCP on host)
+  // MCP auth proxy (inject Bearer token, forward to MCP server on host)
   let mcpBridgeSocketPath = null;
-  if (args.mcpBridgeSocket && args.mcpBridgePort) {
+  if (args.mcpBridgeSocket && args.mcpBridgePort && args.mcpBearerToken) {
     mcpBridgeSocketPath = args.mcpBridgeSocket;
-    startReverseBridge(args.mcpBridgePort, mcpBridgeSocketPath, 'mcp-bridge');
+    startMcpAuthProxy(args.mcpBridgePort, mcpBridgeSocketPath, args.mcpBearerToken);
   }
 
   const cleanup = () => {

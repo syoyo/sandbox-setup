@@ -314,7 +314,7 @@ if [[ "$ENABLE_GITHUB_MCP" == true ]]; then
   done
   (echo >/dev/tcp/127.0.0.1/"$PORT_MCP") 2>/dev/null || { echo "❌ GitHub MCP server did not start"; exit 1; }
   echo "✔ GitHub MCP server ready (port $PORT_MCP)"
-  PROXY_ARGS+=(--mcp-bridge-socket "$SOCKET_MCP" --mcp-bridge-port "$PORT_MCP")
+  PROXY_ARGS+=(--mcp-bridge-socket "$SOCKET_MCP" --mcp-bridge-port "$PORT_MCP" --mcp-bearer-token "$GH_TOKEN")
 fi
 [[ "$IDLE_TIMEOUT" -gt 0 ]] && PROXY_ARGS+=(--idle-timeout "$IDLE_TIMEOUT")
 [[ -n "$NOTIFY_COMMAND" ]] && PROXY_ARGS+=(--notify-command "$NOTIFY_COMMAND")
