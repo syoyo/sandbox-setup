@@ -59,17 +59,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROXY_SCRIPT="$SCRIPT_DIR/credential-proxy.js"
 
 # Defaults
-SOCKET_PATH="/tmp/claude-proxy-$$.sock"  # host-side Unix socket (unique per invocation)
-SANDBOX_SOCKET="/tmp/claude-proxy.sock"  # socket path inside the sandbox
-BRIDGE_PORT=58080                        # loopback TCP port inside the sandbox
-SANDBOX_HOME="/home/sandbox"            # fake home inside sandbox
+SOCKET_ANTHROPIC="/tmp/claude-proxy-anthropic-$$.sock"
+SANDBOX_SOCKET_ANTHROPIC="/tmp/claude-proxy-anthropic.sock"
+PORT_ANTHROPIC=58080
+PORT_GITHUB_CONNECT=58081   # HTTPS CONNECT proxy for api.github.com (host-side, internet-facing)
+SANDBOX_HOME="/home/sandbox"
 WORKDIR="$(pwd)"
 MOUNT_CLAUDE_MD=false
-SHARE_CLAUDE_DIR=false  # set to true via --share-claude-dir
-ISOLATE_NET=false      # set to true via --no-network
-BIND_BINARIES=false    # set to true via --bind-binaries
-LAUNCH_SHELL=false     # set to true via --shell
-EXTRA_PROXY_ARGS=()    # forwarded to credential-proxy.js (e.g. --enable-github)
+SHARE_CLAUDE_DIR=false
+ISOLATE_NET=false
+BIND_BINARIES=false
+LAUNCH_SHELL=false
+ENABLE_GITHUB=false
 CLAUDE_ARGS=()
 PROXY_PID=""
 TEMP_CREDS=""
@@ -87,13 +88,12 @@ while [[ $# -gt 0 ]]; do
     --bind-binaries)    BIND_BINARIES=true; shift ;;
     --shell)            LAUNCH_SHELL=true; shift ;;
     --dummy-credentials) DUMMY_CREDS_FILE=$2; shift 2 ;;
-    --socket)           SOCKET_PATH=$2; shift 2 ;;
-    --bridge-port)      BRIDGE_PORT=$2; shift 2 ;;
     --workdir)          WORKDIR=$2; shift 2 ;;
     --sandbox-home)     SANDBOX_HOME_SEED=$2; shift 2 ;;
-    # Pass service-toggle flags through to the proxy
-    --enable-anthropic|--disable-anthropic|--enable-github|--disable-github)
-                        EXTRA_PROXY_ARGS+=("$1"); shift ;;
+    --enable-github)    ENABLE_GITHUB=true;  shift ;;
+    --disable-github)   ENABLE_GITHUB=false; shift ;;
+    --anthropic-port)   PORT_ANTHROPIC=$2; shift 2 ;;
+    --github-port)      PORT_GITHUB_CONNECT=$2; shift 2 ;;
     --help|-h)
       cat <<'EOF'
 claudebox.sh — Run Claude Code in a bwrap sandbox with host-side credential proxy
@@ -115,22 +115,23 @@ OPTIONS:
   --dummy-credentials FILE  Use FILE as the dummy .credentials.json instead of auto-generating
                          one from the host credentials. The file must contain valid JSON with
                          the dummy token values that the proxy is configured to replace.
-  --socket PATH          Host Unix socket path (default: /tmp/claude-proxy-PID.sock)
-  --bridge-port PORT     TCP port for the credential proxy bridge (default: 58080)
   --workdir DIR          Working directory to mount read-write (default: CWD)
   --sandbox-home DIR     Copy files from DIR into the sandbox home at startup
-  --enable-github        Enable GitHub credential injection in proxy
-  --disable-anthropic    Disable Anthropic credential injection in proxy
+  --enable-github        Enable GitHub access: passes real GH_TOKEN into sandbox and starts
+                         a host-side HTTPS CONNECT proxy whitelisting only api.github.com.
+                         Requires GH_TOKEN to be set on the host.
+  --anthropic-port PORT  TCP port for Anthropic proxy bridge (default: 58080)
+  --github-port PORT     TCP port for GitHub CONNECT proxy (default: 58081)
   --help                 Show this help
 
 NETWORK MODES:
   default (no --no-network)
-    Sandbox shares host network namespace. Host proxy is bridged to 127.0.0.1:PORT on
-    the host and reached from the sandbox at the same address. Works everywhere.
+    Sandbox shares host network namespace. Each service proxy listens on its own
+    host loopback port, reachable from inside the sandbox at the same address.
 
   --no-network
     Full net namespace isolation via --unshare-net. External traffic is impossible.
-    The proxy socket is bridged to 127.0.0.1:PORT inside the sandbox's own loopback.
+    Each proxy socket is bridged to its own loopback port inside the sandbox.
     Requires kernel.apparmor_restrict_unprivileged_userns=0 on Ubuntu 22.04+.
 
 ENVIRONMENT:
@@ -141,7 +142,7 @@ SANDBOX PROPERTIES:
   - Only <workdir> is writable; all other paths are read-only
   - Real home directory NOT exposed (fake home at /home/sandbox on tmpfs)
   - Real credentials NOT in sandbox (dummy tokens replaced by host proxy per-request)
-  - Unix socket bind-mounted read-only for proxy transport
+  - Each service has a dedicated Unix socket + TCP port; no URL-based routing
 EOF
       exit 0 ;;
     --) shift; CLAUDE_ARGS+=("$@"); break ;;
@@ -155,7 +156,7 @@ done
 cleanup() {
   local code=$?
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
-  [[ -S "$SOCKET_PATH" ]] && rm -f "$SOCKET_PATH" || true
+  rm -f "$SOCKET_ANTHROPIC" 2>/dev/null || true
   # Only delete if we auto-generated it, not if the user supplied their own file
   [[ -n "$TEMP_CREDS" && -f "$TEMP_CREDS" && -z "$DUMMY_CREDS_FILE" ]] && rm -f "$TEMP_CREDS" || true
   exit $code
@@ -195,24 +196,27 @@ fi
 # In default mode also open a host-side TCP bridge so the sandbox can reach it
 # on 127.0.0.1:BRIDGE_PORT without needing a separate net namespace.
 # ---------------------------------------------------------------------------
-echo "▶ Starting credential proxy on $SOCKET_PATH"
-PROXY_TCP_ARGS=()
+echo "▶ Starting credential proxy (anthropic)"
+PROXY_ARGS=(--anthropic-socket "$SOCKET_ANTHROPIC")
+# In shared-network mode, open a host-side TCP bridge so the sandbox can reach
+# the proxy on 127.0.0.1:PORT_ANTHROPIC without its own net namespace.
 if [[ "$ISOLATE_NET" == false ]]; then
-  # Bridge on host loopback — reachable from inside the sandbox (shared net ns)
-  PROXY_TCP_ARGS+=(--tcp-bridge-port "$BRIDGE_PORT")
+  PROXY_ARGS+=(--anthropic-tcp-port "$PORT_ANTHROPIC")
 fi
-node "$PROXY_SCRIPT" --socket "$SOCKET_PATH" \
-  "${PROXY_TCP_ARGS[@]+"${PROXY_TCP_ARGS[@]}"}" \
-  "${EXTRA_PROXY_ARGS[@]+"${EXTRA_PROXY_ARGS[@]}"}" &
+if [[ "$ENABLE_GITHUB" == true ]]; then
+  PROXY_ARGS+=(--github-connect-port "$PORT_GITHUB_CONNECT")
+fi
+
+node "$PROXY_SCRIPT" "${PROXY_ARGS[@]}" &
 PROXY_PID=$!
 
 for _i in $(seq 1 25); do
-  [[ -S "$SOCKET_PATH" ]] && break
+  [[ -S "$SOCKET_ANTHROPIC" ]] && break
   sleep 0.2
   kill -0 "$PROXY_PID" 2>/dev/null || { echo "❌ Proxy process died"; exit 1; }
 done
-[[ -S "$SOCKET_PATH" ]] || { echo "❌ Proxy socket did not appear"; exit 1; }
-echo "✔ Proxy ready ($SOCKET_PATH)"
+[[ -S "$SOCKET_ANTHROPIC" ]] || { echo "❌ Proxy socket did not appear"; exit 1; }
+echo "✔ Proxy ready ($SOCKET_ANTHROPIC${ENABLE_GITHUB:+, github CONNECT :$PORT_GITHUB_CONNECT → api.github.com})"
 
 # ---------------------------------------------------------------------------
 # Resolve dummy credentials file
@@ -316,8 +320,8 @@ BWRAP=(
   # ---- Workdir — the ONLY read-write bind mount ----
   --bind "$WORKDIR" /workspace
 
-  # ---- Credential proxy socket (read-only; write would be useless on a socket) ----
-  --ro-bind "$SOCKET_PATH" "$SANDBOX_SOCKET"
+  # ---- Credential proxy sockets (one per service, read-only) ----
+  --ro-bind "$SOCKET_ANTHROPIC" "$SANDBOX_SOCKET_ANTHROPIC"
 
   # ---- Environment ----
   --clearenv
@@ -327,16 +331,30 @@ BWRAP=(
   --setenv SHELL   /bin/bash
   --setenv TERM    "${TERM:-xterm-256color}"
   --setenv PATH    "$SANDBOX_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
-  # Proxy URL: loopback TCP exposed by the in-sandbox bridge
-  --setenv ANTHROPIC_BASE_URL "http://127.0.0.1:$BRIDGE_PORT"
-  # Ensure no external proxy overrides our proxy URL
-  --setenv  HTTP_PROXY  ""
-  --setenv  HTTPS_PROXY ""
-  --setenv  ALL_PROXY   ""
-  --setenv  NO_PROXY    "*"
+  --setenv ANTHROPIC_BASE_URL "http://127.0.0.1:$PORT_ANTHROPIC"
+  # Block all external HTTP/HTTPS traffic by default.
+  # 127.0.0.1 is listed in NO_PROXY so the Anthropic bridge is reached directly.
+  # When --enable-github is active, HTTPS_PROXY is overridden below to allow
+  # api.github.com through the host-side CONNECT proxy.
+  --setenv HTTP_PROXY  ""
+  --setenv HTTPS_PROXY ""
+  --setenv ALL_PROXY   ""
+  --setenv NO_PROXY    "127.0.0.1,localhost,::1"
 
   --chdir /workspace
 )
+
+# GitHub: gh CLI uses HTTPS to api.github.com. We route it through a host-side
+# CONNECT proxy (which has real internet access) that whitelists only api.github.com.
+# The real GH_TOKEN is passed directly since we can't inject into a TLS tunnel.
+if [[ "$ENABLE_GITHUB" == true ]]; then
+  [[ -n "${GH_TOKEN:-}" ]] || { echo "❌ --enable-github requires GH_TOKEN to be set on the host"; exit 1; }
+  BWRAP+=(
+    --setenv GH_TOKEN     "$GH_TOKEN"
+    --setenv GITHUB_TOKEN "$GH_TOKEN"
+    --setenv HTTPS_PROXY  "http://127.0.0.1:$PORT_GITHUB_CONNECT"
+  )
+fi
 
 # ~/.claude sharing
 # Two modes:
@@ -396,21 +414,35 @@ fi
 # ---------------------------------------------------------------------------
 # Sandbox init script (runs as PID 1 inside the sandbox)
 # ---------------------------------------------------------------------------
-BRIDGE_PORT_VAL="$BRIDGE_PORT"
-SANDBOX_SOCKET_VAL="$SANDBOX_SOCKET"
 SANDBOX_HOME_VAL="$SANDBOX_HOME"
+SANDBOX_SOCKET_ANTHROPIC_VAL="$SANDBOX_SOCKET_ANTHROPIC"
+PORT_ANTHROPIC_VAL="$PORT_ANTHROPIC"
+ISOLATE_NET_VAL="$ISOLATE_NET"
 
-if [[ "$ISOLATE_NET" == true ]]; then
-  NET_DESC="isolated (loopback only)"
-  # ANTHROPIC_BASE_URL points to the in-sandbox bridge (same as before)
-  BWRAP+=(--setenv ANTHROPIC_BASE_URL "http://127.0.0.1:$BRIDGE_PORT")
-else
-  NET_DESC="shared host network"
-  # ANTHROPIC_BASE_URL points to the host-side bridge already listening on host loopback
-  BWRAP+=(--setenv ANTHROPIC_BASE_URL "http://127.0.0.1:$BRIDGE_PORT")
-fi
-
+NET_DESC="$([[ "$ISOLATE_NET" == true ]] && echo "isolated (loopback only)" || echo "shared host network")"
 echo "▶ Launching sandbox (workdir: $WORKDIR, network: $NET_DESC)"
+
+# Helper: start one TCP→Unix bridge inside the sandbox (for --no-network mode)
+# Usage: start_bridge <socket> <port> <label>
+# Tries node credential-proxy.js --bridge-only first, falls back to socat.
+read -r -d '' _BRIDGE_HELPER <<'BASHEOF' || true
+start_bridge() {
+  local sock="$1" port="$2" label="$3"
+  if command -v node >/dev/null 2>&1 && [[ -f /workspace/credential-proxy.js ]]; then
+    node /workspace/credential-proxy.js --bridge-only --socket "$sock" --tcp-bridge-port "$port" &
+    for _i in $(seq 1 20); do
+      (echo >/dev/tcp/127.0.0.1/"$port") 2>/dev/null && break || true
+      sleep 0.1
+    done
+  elif command -v socat >/dev/null 2>&1; then
+    socat TCP-LISTEN:"$port",fork,reuseaddr UNIX-CLIENT:"$sock" &
+    sleep 0.3
+  else
+    echo "❌ --no-network: need node or socat for in-sandbox bridge ($label)"
+    exit 1
+  fi
+}
+BASHEOF
 
 "${BWRAP[@]}" -- bash -c '
   set -euo pipefail
@@ -424,27 +456,10 @@ echo "▶ Launching sandbox (workdir: $WORKDIR, network: $NET_DESC)"
   printf '"'"'{"hasCompletedOnboarding": true, "installMethod": "native"}'"'"' > "'"$SANDBOX_HOME_VAL"'/.claude.json"
 
   # In --no-network mode the sandbox has its own net namespace, so we need an
-  # in-sandbox TCP bridge from the mounted Unix socket to 127.0.0.1:PORT.
-  # In default mode the host-side bridge is already listening on the shared loopback.
-  if [[ "'"$ISOLATE_NET"'" == true ]]; then
-    if command -v node >/dev/null 2>&1 && [[ -f /workspace/credential-proxy.js ]]; then
-      node /workspace/credential-proxy.js \
-        --bridge-only \
-        --socket "'"$SANDBOX_SOCKET_VAL"'" \
-        --tcp-bridge-port "'"$BRIDGE_PORT_VAL"'" &
-      # Wait for bridge to be ready
-      for _i in $(seq 1 20); do
-        (echo >/dev/tcp/127.0.0.1/'"$BRIDGE_PORT_VAL"') 2>/dev/null && break || true
-        sleep 0.1
-      done
-    elif command -v socat >/dev/null 2>&1; then
-      socat TCP-LISTEN:'"$BRIDGE_PORT_VAL"',fork,reuseaddr \
-        UNIX-CLIENT:"'"$SANDBOX_SOCKET_VAL"'" &
-      sleep 0.3
-    else
-      echo "❌ --no-network requires node (/workspace/credential-proxy.js) or socat for the in-sandbox bridge"
-      exit 1
-    fi
+  # in-sandbox TCP bridge from the mounted Unix socket to 127.0.0.1:PORT_ANTHROPIC.
+  if [[ "'"$ISOLATE_NET_VAL"'" == true ]]; then
+    '"$_BRIDGE_HELPER"'
+    start_bridge "'"$SANDBOX_SOCKET_ANTHROPIC_VAL"'" '"$PORT_ANTHROPIC_VAL"' anthropic
   fi
 
   echo "✔ Sandbox ready  ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL"
