@@ -1,5 +1,5 @@
-#./claudebox.sh --shell --workdir work
+# Basic shell (network isolated by default):
+./claudebox.sh --shell --workdir work
 
-# Example: inject GitHub token from cred/gh_readonly
-GH_TOKEN=$(cat "$(dirname "$0")/cred/gh_readonly") \
-  ./claudebox.sh --enable-github --shell --workdir work
+# With GitHub access (GH_TOKEN must be set in the environment):
+# GH_TOKEN=<token> ./claudebox.sh --enable-github --shell --workdir work

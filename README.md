@@ -1,46 +1,53 @@
 # claudebox
 
-Run Claude Code in a [bubblewrap](https://github.com/containers/bubblewrap) sandbox with a host-side credential proxy.
+Run [Claude Code](https://docs.anthropic.com/en/docs/claude-code) in a [bubblewrap](https://github.com/containers/bubblewrap) sandbox with a host-side credential proxy.
 
-Real API credentials stay on the host machine and are injected into outgoing requests via a Unix domain socket. The sandbox process never sees them.
+Real API credentials stay on the host. The sandbox only sees dummy tokens, which the host-side proxy replaces with real ones before forwarding to Anthropic. The sandbox process never sees real credentials.
 
 ## Architecture
 
 ```
-Host                                          Anthropic API
-┌──────────────────────────────────┐         ┌─────────────┐
-│  credential-proxy.js             │         │             │
-│  (Unix socket: /tmp/proxy.sock)  │────────▶│  api.anthropic.com
-│  reads ~/.claude/.credentials    │         │             │
-└──────────────┬───────────────────┘         └─────────────┘
-               │ Unix socket (bind-mounted, read-only)
-               │
-┌──────────────▼───────────────────┐
-│  bwrap sandbox                   │
-│  ┌────────────────────────────┐  │
-│  │ TCP bridge (loopback only) │  │  ← isolated net namespace,
-│  │ 127.0.0.1:58080            │  │    no external network
-│  └────────────┬───────────────┘  │
-│               │                  │
-│  ┌────────────▼───────────────┐  │
-│  │  claude                    │  │
-│  │  ANTHROPIC_BASE_URL=       │  │
-│  │    http://127.0.0.1:58080  │  │
-│  └────────────────────────────┘  │
-│                                  │
-│  Filesystem:                     │
-│    /workspace  ← rw (workdir)    │
-│    /usr, /etc  ← ro              │
-│    /home/sandbox ← tmpfs         │
-│    (real home: not mounted)      │
-└──────────────────────────────────┘
+Host                                             Anthropic API
+┌─────────────────────────────────────┐         ┌──────────────────┐
+│  credential-proxy.js                │         │                  │
+│  ├─ Anthropic proxy (Unix socket)   │────────>│ api.anthropic.com│
+│  │  dummy token → real token        │         │                  │
+│  └─ GitHub CONNECT proxy (Unix sock)│──┐      └──────────────────┘
+│                                     │  │
+└────────┬────────────────────┬───────┘  │      ┌──────────────────┐
+         │ bind-mount (ro)    │          └─────>│ api.github.com   │
+         │                    │                 │ (CONNECT tunnel) │
+┌────────▼────────────────────▼───────┐         └──────────────────┘
+│  bwrap sandbox (--unshare-net)      │
+│                                     │
+│  ┌────────────────────────────┐     │
+│  │ TCP bridge (loopback)      │     │  ← isolated net namespace
+│  │ 127.0.0.1:58080 → Anthropic│     │    no external network
+│  │ 127.0.0.1:58081 → GitHub   │     │    (GitHub bridge only
+│  └────────────┬───────────────┘     │     with --enable-github)
+│               │                     │
+│  ┌────────────▼───────────────┐     │
+│  │  claude                    │     │
+│  │  ANTHROPIC_BASE_URL=       │     │
+│  │    http://127.0.0.1:58080  │     │
+│  │  HTTPS_PROXY=              │     │
+│  │    http://127.0.0.1:58081  │     │
+│  └────────────────────────────┘     │
+│                                     │
+│  Filesystem:                        │
+│    /workspace     ← rw (workdir)    │
+│    /usr, /etc/*   ← ro (selective)  │
+│    /home/sandbox  ← tmpfs (fake)    │
+│    /sys, /tmp     ← tmpfs           │
+└─────────────────────────────────────┘
 ```
 
 ## Requirements
 
 - Linux with [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`)
-- Node.js on the host
+- Node.js on the host (for credential-proxy.js)
 - Claude Code credentials configured on the host (`claude login`)
+- `systemd-run` (for `--mem-limit` / `--cpu-limit`, included in systemd)
 
 ```bash
 # Ubuntu / Debian
@@ -53,12 +60,18 @@ sudo dnf install bubblewrap
 sudo pacman -S bubblewrap
 ```
 
+On Ubuntu 22.04+ (network isolation requires):
+```bash
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+```
+
 ## Files
 
 | File | Purpose |
 |---|---|
-| `claudebox.sh` | Sandbox launcher (bwrap) |
-| `credential-proxy.js` | Host-side credential injection proxy |
+| `claudebox.sh` | Sandbox launcher (bwrap + systemd-run) |
+| `credential-proxy.js` | Host-side credential injection proxy + CONNECT proxy |
+| `run-example.sh` | Example invocations |
 
 ## Quick Start
 
@@ -68,128 +81,176 @@ sudo pacman -S bubblewrap
 
 # Pass arguments to claude
 ./claudebox.sh -- -p "explain this codebase"
-./claudebox.sh -- --continue
 
-# Mount your personal CLAUDE.md (read-only)
-./claudebox.sh --mount-claude-md
+# Open a shell inside the sandbox (for debugging)
+./claudebox.sh --shell
 
 # Specific working directory
 ./claudebox.sh --workdir ~/projects/myapp
 
-# Enable GitHub credential injection as well
-./claudebox.sh --enable-github
+# Enable GitHub access
+GH_TOKEN=ghp_xxx ./claudebox.sh --enable-github
+
+# With resource limits
+./claudebox.sh --mem-limit 4G --cpu-limit 400
 
 # Full example
-./claudebox.sh --workdir ~/projects/myapp --mount-claude-md --enable-github -- --continue
+GH_TOKEN=ghp_xxx ./claudebox.sh \
+  --workdir ~/projects/myapp \
+  --mount-claude-md \
+  --enable-github \
+  --mem-limit 8G \
+  --cpu-limit 800 \
+  -- --continue
 ```
 
 ## Options
 
-### claudebox.sh
+```
+--workdir DIR          Working directory to mount read-write (default: CWD).
+                       Symlinks are resolved. Cannot be / or $HOME.
+--shell                Launch bash instead of claude (useful for debugging).
+--mount-claude-md      Mount ~/.claude/CLAUDE.md into sandbox (read-only).
+--share-claude-dir     Mount entire ~/.claude read-only (credentials replaced with dummies).
+--sandbox-home DIR     Copy files from DIR into sandbox home at startup.
+--enable-github        Enable GitHub access via CONNECT proxy (requires GH_TOKEN env var).
+--disable-github       Explicitly disable GitHub access (default).
+--share-network        Share host network namespace (weaker isolation; default: isolated).
+--bind-binaries        Bind-mount node and claude from host paths into /run/sandbox-bin.
+--dummy-credentials F  Use FILE as the dummy .credentials.json.
+--mem-limit SIZE       Memory limit, e.g. 4G, 512M (uses cgroups via systemd-run).
+--cpu-limit PERCENT    CPU limit as percentage: 100 = 1 core, 200 = 2 cores, etc.
+--anthropic-port PORT  TCP port for Anthropic proxy bridge (default: 58080).
+--github-port PORT     TCP port for GitHub CONNECT proxy bridge (default: 58081).
+--help                 Show help.
+```
+
+## Network Isolation
+
+**Default: fully isolated** (`--unshare-net`). The sandbox has no external network access.
+All API communication goes through Unix socket bridges:
 
 ```
---mount-claude-md      Mount ~/.claude/CLAUDE.md into the sandbox (read-only)
---socket PATH          Host Unix socket path (default: /tmp/claude-proxy-PID.sock)
---bridge-port PORT     In-sandbox loopback port for the TCP bridge (default: 58080)
---workdir DIR          Working directory to mount read-write (default: CWD)
---enable-github        Enable GitHub credential injection in proxy
---disable-anthropic    Disable Anthropic credential injection in proxy
+sandbox 127.0.0.1:58080 → in-sandbox bridge → Unix socket (bind-mounted) → host proxy → api.anthropic.com
+sandbox 127.0.0.1:58081 → in-sandbox bridge → Unix socket (bind-mounted) → host CONNECT proxy → api.github.com
 ```
 
-### credential-proxy.js (standalone)
+The GitHub bridge is only started when `--enable-github` is set. Without it, `HTTPS_PROXY`
+is not set and the GitHub CONNECT socket is mounted but not bridged — no GitHub access.
 
+**`--share-network`**: Shares the host network namespace. Faster startup (no in-sandbox
+bridges needed), but weaker isolation: any compiled binary or raw-socket code inside the
+sandbox can bypass the proxy and reach the internet directly. Use only for convenience
+during development.
+
+## GitHub Access
+
+GitHub access uses an HTTPS CONNECT tunnel proxy. The sandbox's `HTTPS_PROXY` points
+to the in-sandbox bridge, which tunnels through to the host-side CONNECT proxy, which
+connects to `api.github.com:443`. The TLS session is end-to-end between `gh` and GitHub.
+
+The CONNECT proxy enforces an allowlist: only `api.github.com:443` is permitted. All
+other CONNECT targets are rejected with 403.
+
+```bash
+# GH_TOKEN must be set in the environment
+GH_TOKEN=ghp_xxx ./claudebox.sh --enable-github --shell --workdir work
+
+# Inside sandbox:
+gh repo view owner/repo
 ```
---socket PATH          Unix socket path (default: /tmp/claude-proxy.sock)
---tcp-bridge-port PORT Also open a TCP listener bridging to the socket
---bridge-only          TCP→Unix bridge only; for use inside the sandbox
---enable-anthropic     Enable Anthropic injection (default: on)
---disable-anthropic    Disable Anthropic injection
---enable-github        Enable GitHub injection (default: off)
---disable-github       Disable GitHub injection
---verbose              Log all proxied requests
+
+**Note**: `GH_TOKEN` is passed directly into the sandbox environment because the CONNECT
+proxy tunnels encrypted TLS traffic and cannot inject authentication headers. The token
+should be scoped with minimal permissions (read-only recommended).
+
+## Resource Limits
+
+CPU and memory limits are enforced via cgroups using `systemd-run --user --scope`.
+
+```bash
+# 4 GB memory, 2 CPU cores
+./claudebox.sh --mem-limit 4G --cpu-limit 200
+
+# 8 GB memory, no CPU limit
+./claudebox.sh --mem-limit 8G
+
+# 400% CPU (4 cores), no memory limit
+./claudebox.sh --cpu-limit 400
 ```
+
+- `--mem-limit`: Sets `MemoryMax` and `MemorySwapMax=0` (no swap escape).
+- `--cpu-limit`: Sets `CPUQuota` (100 = 1 core, 200 = 2 cores, etc.).
+
+### OOM Behavior
+
+When the sandbox exceeds its memory limit, the Linux cgroup v2 OOM killer selects and
+kills the process using the most memory within the cgroup. Typically this means:
+
+- **Child processes** (python, node, compiled programs) are killed first.
+- **The shell** (bash) usually survives because it uses little memory.
+- The sandbox continues running — the killed process exits with an error.
+
+If the entire cgroup scope is killed (e.g., every process exceeds the limit simultaneously),
+`claudebox.sh` detects the OOM condition by checking:
+1. Exit code 137 (SIGKILL) or 143 (SIGTERM from systemd)
+2. `journalctl --user` for OOM events in the scope
+3. `dmesg` for kernel OOM killer messages
+
+and prints:
+```
+⚠ SANDBOX OOM KILLED — memory limit (4G) exceeded (exit code: 137)
+  Increase with --mem-limit or reduce sandbox workload.
+```
+
+**Important**: The OOM killer targets individual processes, not the entire sandbox.
+A single process exceeding the limit will be killed, but the sandbox shell remains
+operational. This is standard Linux cgroup v2 behavior.
 
 ## Sandbox Security Properties
 
 | Property | Detail |
 |---|---|
-| **Network** | Fully isolated namespace; loopback only (`127.0.0.1` for bridge) |
-| **Filesystem writes** | Only `--workdir` is read-write; everything else is read-only or tmpfs |
-| **Home directory** | Real `$HOME` is not mounted; fake home at `/home/sandbox` (tmpfs) |
-| **Credentials** | Only dummy tokens inside; real tokens injected by host proxy per-request |
-| **Proxy socket** | Bind-mounted read-only; sandbox can connect but not modify it |
-| **Environment** | `--clearenv`; only an explicit allow-list is set |
+| **Network** | Fully isolated namespace by default; loopback only |
+| **Filesystem** | Only `--workdir` is read-write; everything else read-only or tmpfs |
+| **Home directory** | Real `$HOME` not mounted; fake home at `/home/sandbox` (tmpfs) |
+| **Anthropic credentials** | Per-session random dummy token; real token injected by host proxy |
+| **Proxy socket** | Bind-mounted read-only; sandbox can connect but not modify |
+| **Environment** | `--clearenv`; only explicit allowlist set |
+| **/etc** | Only ~12 specific files mounted (ld.so, SSL certs, DNS, passwd/group) |
+| **/sys** | Empty tmpfs (no hardware fingerprinting) |
+| **Namespaces** | user, ipc, pid, uts, cgroup, net (all unshared) |
+| **Path allowlist** | Proxy only forwards `/v1/(messages\|complete\|models\|count_tokens)` |
+| **URL normalization** | Path traversal (`../`) resolved before allowlist check |
+| **Body size limit** | 10 MB max request body to prevent host OOM via proxy |
+| **Socket location** | `$XDG_RUNTIME_DIR` (user-private) instead of `/tmp` |
+| **Init script** | Fully static single-quoted string; no shell interpolation of user values |
 
-## Credential Sources
+## Credential Sources (Anthropic)
 
-### Claude Code (Anthropic)
-
-Checked in order:
+The host-side proxy checks in order:
 
 1. `CLAUDE_CREDENTIALS_FILE` environment variable (path to JSON file)
 2. macOS Keychain (`security find-generic-password -s "Claude Code-credentials"`)
 3. `~/.claude/.credentials.json`
 4. `~/.config/claude/auth.json`
 
-### GitHub (opt-in via `--enable-github`)
+## Running Multiple Sandboxes
 
-Checked in order:
-
-1. `GH_TOKEN` / `GITHUB_TOKEN` / `GH_ENTERPRISE_TOKEN` environment variable
-2. `~/.config/gh/hosts.yml` (gh CLI config)
-3. `gh auth token` (gh CLI)
-
-GitHub requests are routed to `api.github.com` when the incoming request has:
-- Header `x-proxy-target: github`, or
-- URL path starting with `/github/`, `/repos/`, or `/user`
-
-## Network Modes
-
-### Default (no `--no-network`)
-
-The sandbox shares the host network namespace. The credential proxy starts a TCP bridge
-on the **host** loopback (`127.0.0.1:58080`) which is directly reachable from inside the
-sandbox. No in-sandbox bridge process is needed. Works on all systems with no kernel
-configuration changes.
-
-```
-sandbox (shared net ns) → 127.0.0.1:58080 → host TCP bridge → Unix socket → proxy
-```
-
-### `--no-network`
-
-bwrap creates an isolated network namespace (external traffic impossible; loopback only).
-An in-sandbox TCP bridge is started to connect Claude to the mounted Unix socket.
-
-```
-sandbox loopback:58080 → in-sandbox bridge → Unix socket → host proxy → api.anthropic.com
-```
-
-Requires on Ubuntu 22.04+:
-```bash
-sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-```
-
-## Running Multiple Sandboxes in Parallel
-
-Each invocation uses a unique socket path (`/tmp/claude-proxy-PID.sock`) and you can specify different bridge ports:
+Each invocation uses PID-scoped socket paths and you can specify different bridge ports:
 
 ```bash
-./claudebox.sh --workdir ~/proj-a --bridge-port 58080 &
-./claudebox.sh --workdir ~/proj-b --bridge-port 58081 &
+./claudebox.sh --workdir ~/proj-a --anthropic-port 58080 --github-port 58081 &
+./claudebox.sh --workdir ~/proj-b --anthropic-port 58082 --github-port 58083 &
 ```
 
 ## Troubleshooting
 
 **`bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`**
-This happens with `--no-network` on Ubuntu 22.04+ where AppArmor blocks unprivileged
-user namespaces from configuring network interfaces. Without `--no-network` (the default)
-this error does not occur — the sandbox shares the host network namespace and the proxy
-is bridged on the host-side loopback instead.
 
-To enable `--no-network`, relax the AppArmor restriction:
+Network isolation requires on Ubuntu 22.04+:
 ```bash
-# temporary (until reboot)
+# temporary
 sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
 # permanent
@@ -198,22 +259,27 @@ sudo sysctl --system
 ```
 
 **`bwrap: setting up uid map: Permission denied`**
-User namespaces are fully disabled on this kernel. Check:
+
+User namespaces are disabled:
 ```bash
-sysctl kernel.unprivileged_userns_clone   # should be 1
-# If 0:
 sudo sysctl -w kernel.unprivileged_userns_clone=1
 ```
 
 **`❌ Proxy socket did not appear`**
+
 Check that Node.js can read your credentials:
 ```bash
 node -e "const fs=require('fs'),os=require('os'),p=require('path');
 console.log(fs.readFileSync(p.join(os.homedir(),'.claude','.credentials.json'),'utf8').slice(0,80))"
 ```
 
-**Claude prompts for login inside sandbox**
-The dummy credentials file wasn't generated correctly. Run with `bash -x ./claudebox.sh` to trace the issue.
+**`❌ systemd-run required for --mem-limit/--cpu-limit`**
 
-**`Neither node nor socat found`**
-The bridge needs either `node` (with `credential-proxy.js` in the workdir) or `socat` accessible inside the sandbox. Since `node` is bind-mounted to `/usr/local/bin/node` in the sandbox and `credential-proxy.js` is in `/workspace`, this should work automatically as long as you run `claudebox.sh` from the directory containing `credential-proxy.js`, or copy `credential-proxy.js` into your workdir.
+Install systemd (usually already present on modern Linux):
+```bash
+sudo apt install systemd  # Debian/Ubuntu
+```
+
+**Claude prompts for login inside sandbox**
+
+The dummy credentials file wasn't generated correctly. Run with `bash -x ./claudebox.sh` to trace.

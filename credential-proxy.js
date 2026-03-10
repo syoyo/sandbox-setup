@@ -31,13 +31,16 @@ const net   = require('net');
 const fs    = require('fs');
 const os    = require('os');
 const path  = require('path');
+const url   = require('url');
 const { spawnSync } = require('child_process');
 
 // ---------------------------------------------------------------------------
 // Dummy token placed in the sandbox by claudebox.sh.
 // The proxy replaces it with the real token before forwarding.
+// HIGH-4: per-session random token from SESSION_DUMMY_TOKEN env; falls back to
+// a fixed value only for manual/standalone proxy usage.
 // ---------------------------------------------------------------------------
-const DUMMY_CLAUDE_TOKEN =
+const DUMMY_CLAUDE_TOKEN = process.env.SESSION_DUMMY_TOKEN ||
   'sk-ant-oat01-dummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDQ-DummyAA';
 
 const DEFAULT_ANTHROPIC_SOCKET    = '/tmp/claude-proxy-anthropic.sock';
@@ -52,6 +55,9 @@ const ANTHROPIC_PATH_ALLOWLIST = /^\/v1\/(messages|complete|models|count_tokens)
 // Hosts the CONNECT proxy is allowed to tunnel to (HIGH-1: enforced per-entry).
 const GITHUB_ALLOWLIST = ['api.github.com'];
 
+// MED-5: maximum request body size (bytes) to prevent host OOM via proxy.
+const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB
+
 // ---------------------------------------------------------------------------
 // Argument parsing
 // ---------------------------------------------------------------------------
@@ -61,6 +67,7 @@ function parseArgs(argv) {
     anthropicSocket:   null,
     anthropicTcpPort:  null,
     githubConnectPort: null,
+    githubSocket:      null,
     enableGithub:      false,
     bridgeOnly:        false,
     bridgeSocket:      null,
@@ -73,6 +80,7 @@ function parseArgs(argv) {
       case '--anthropic-socket':    args.anthropicSocket   = argv[++i]; break;
       case '--anthropic-tcp-port':  args.anthropicTcpPort  = parseInt(argv[++i], 10); break;
       case '--github-connect-port': args.githubConnectPort = parseInt(argv[++i], 10); break;
+      case '--github-socket':        args.githubSocket  = argv[++i]; break;
       case '--enable-github':       args.enableGithub = true; break;
       case '--bridge-only':         args.bridgeOnly = true; break;
       case '--socket':              args.bridgeSocket  = argv[++i]; break;
@@ -246,17 +254,38 @@ function forward(method, urlPath, headers, body, res, verbose, onRetry) {
 
 function createHandler(verbose) {
   return function (req, res) {
+    // MED-4: normalize URL path to prevent traversal (e.g. /v1/messages/../../admin).
+    const parsed = new URL(req.url, 'http://localhost');
+    const normalizedPath = path.posix.normalize(parsed.pathname);
+    if (normalizedPath !== parsed.pathname) {
+      if (verbose) console.log(`[anthropic] path normalized: ${req.url} → ${normalizedPath}`);
+    }
+
     // HIGH-2: restrict to known Anthropic inference paths only.
-    if (!ANTHROPIC_PATH_ALLOWLIST.test(req.url)) {
-      if (verbose) console.log(`[anthropic] blocked path: ${req.url}`);
+    if (!ANTHROPIC_PATH_ALLOWLIST.test(normalizedPath)) {
+      if (verbose) console.log(`[anthropic] blocked path: ${normalizedPath}`);
       res.writeHead(403, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: `Path not allowed: ${req.url}` }));
+      res.end(JSON.stringify({ error: `Path not allowed: ${normalizedPath}` }));
       return;
     }
 
+    // Use normalized path for forwarding.
+    const forwardUrl = normalizedPath + parsed.search;
+
     const chunks = [];
-    req.on('data', (c) => chunks.push(c));
+    let bodyLen = 0;
+    req.on('data', (c) => {
+      bodyLen += c.length;
+      if (bodyLen > MAX_BODY_SIZE) {
+        req.destroy();
+        res.writeHead(413, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Request body too large' }));
+        return;
+      }
+      chunks.push(c);
+    });
     req.on('end', () => {
+      if (bodyLen > MAX_BODY_SIZE) return; // already responded with 413
       const body = Buffer.concat(chunks);
       const base = filterRequestHeaders(req.headers);
       base['host'] = 'api.anthropic.com';
@@ -272,7 +301,7 @@ function createHandler(verbose) {
         }
         const h = result.headers;
         if (body.length) h['content-length'] = String(body.length);
-        forward(req.method, req.url, h, body, res, verbose, retry ? null : () => attempt(true));
+        forward(req.method, forwardUrl, h, body, res, verbose, retry ? null : () => attempt(true));
       }
 
       attempt(false);
@@ -307,8 +336,8 @@ function startTcpBridge(socketPath, port, label) {
 // HIGH-1: enforces both hostname AND port (must be 443)
 // ---------------------------------------------------------------------------
 
-function startConnectProxy(port, allowlist, verbose) {
-  const server = net.createServer((client) => {
+function makeConnectHandler(allowlist, verbose) {
+  return function (client) {
     const bufs = [];
     let totalLen = 0;
 
@@ -368,7 +397,12 @@ function startConnectProxy(port, allowlist, verbose) {
 
     client.on('data', onData);
     client.on('error', () => {});
-  });
+  };
+}
+
+function startConnectProxy(port, allowlist, verbose) {
+  const handler = makeConnectHandler(allowlist, verbose);
+  const server = net.createServer(handler);
 
   server.listen(port, '127.0.0.1', () => {
     const desc = allowlist.length ? `${allowlist.join(', ')}:443` : '(none — all blocked)';
@@ -376,6 +410,21 @@ function startConnectProxy(port, allowlist, verbose) {
   });
   server.on('error', (err) => {
     console.error('[github-connect] error:', err.message);
+    process.exit(1);
+  });
+  return server;
+}
+
+function startConnectProxySocket(socketPath, allowlist, verbose) {
+  const handler = makeConnectHandler(allowlist, verbose);
+  const server = net.createServer(handler);
+
+  if (fs.existsSync(socketPath)) fs.unlinkSync(socketPath);
+  server.listen(socketPath, () => {
+    console.log(`[github-connect] CONNECT proxy socket: ${socketPath}`);
+  });
+  server.on('error', (err) => {
+    console.error('[github-connect] socket error:', err.message);
     process.exit(1);
   });
   return server;
@@ -414,13 +463,20 @@ if (args.bridgeOnly) {
 
   startTcpBridge(socketPath, tcpPort, 'anthropic');
 
+  const allowlist = args.enableGithub ? GITHUB_ALLOWLIST : [];
   if (args.githubConnectPort) {
-    const allowlist = args.enableGithub ? GITHUB_ALLOWLIST : [];
     startConnectProxy(args.githubConnectPort, allowlist, args.verbose);
+  }
+
+  let githubSocketPath = null;
+  if (args.githubSocket) {
+    githubSocketPath = args.githubSocket;
+    startConnectProxySocket(githubSocketPath, allowlist, args.verbose);
   }
 
   const cleanup = () => {
     try { fs.unlinkSync(socketPath); } catch (_) {}
+    if (githubSocketPath) { try { fs.unlinkSync(githubSocketPath); } catch (_) {} }
     process.exit(0);
   };
   process.on('SIGINT', cleanup);
