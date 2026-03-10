@@ -421,7 +421,7 @@ echo "▶ Launching sandbox (workdir: $WORKDIR, network: $NET_DESC)"
   fi
 
   # Write minimal Claude config to skip onboarding screen
-  printf '"'"'{"hasCompletedOnboarding": true}'"'"' > "'"$SANDBOX_HOME_VAL"'/.claude.json"
+  printf '"'"'{"hasCompletedOnboarding": true, "installMethod": "native"}'"'"' > "'"$SANDBOX_HOME_VAL"'/.claude.json"
 
   # In --no-network mode the sandbox has its own net namespace, so we need an
   # in-sandbox TCP bridge from the mounted Unix socket to 127.0.0.1:PORT.
