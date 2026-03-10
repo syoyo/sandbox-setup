@@ -196,16 +196,18 @@ fi
 # In default mode also open a host-side TCP bridge so the sandbox can reach it
 # on 127.0.0.1:BRIDGE_PORT without needing a separate net namespace.
 # ---------------------------------------------------------------------------
-echo "▶ Starting credential proxy (anthropic)"
-PROXY_ARGS=(--anthropic-socket "$SOCKET_ANTHROPIC")
+echo "▶ Starting credential proxy"
+PROXY_ARGS=(
+  --anthropic-socket "$SOCKET_ANTHROPIC"
+  # CONNECT proxy always runs; allowlist is empty unless --enable-github is set.
+  --github-connect-port "$PORT_GITHUB_CONNECT"
+)
 # In shared-network mode, open a host-side TCP bridge so the sandbox can reach
-# the proxy on 127.0.0.1:PORT_ANTHROPIC without its own net namespace.
+# the Anthropic proxy on 127.0.0.1:PORT_ANTHROPIC without its own net namespace.
 if [[ "$ISOLATE_NET" == false ]]; then
   PROXY_ARGS+=(--anthropic-tcp-port "$PORT_ANTHROPIC")
 fi
-if [[ "$ENABLE_GITHUB" == true ]]; then
-  PROXY_ARGS+=(--github-connect-port "$PORT_GITHUB_CONNECT")
-fi
+[[ "$ENABLE_GITHUB" == true ]] && PROXY_ARGS+=(--enable-github)
 
 node "$PROXY_SCRIPT" "${PROXY_ARGS[@]}" &
 PROXY_PID=$!
@@ -216,7 +218,7 @@ for _i in $(seq 1 25); do
   kill -0 "$PROXY_PID" 2>/dev/null || { echo "❌ Proxy process died"; exit 1; }
 done
 [[ -S "$SOCKET_ANTHROPIC" ]] || { echo "❌ Proxy socket did not appear"; exit 1; }
-echo "✔ Proxy ready ($SOCKET_ANTHROPIC${ENABLE_GITHUB:+, github CONNECT :$PORT_GITHUB_CONNECT → api.github.com})"
+echo "✔ Proxy ready (anthropic=$SOCKET_ANTHROPIC, CONNECT :$PORT_GITHUB_CONNECT allowlist=${ENABLE_GITHUB:+api.github.com}${ENABLE_GITHUB:-none})"
 
 # ---------------------------------------------------------------------------
 # Resolve dummy credentials file
@@ -332,27 +334,26 @@ BWRAP=(
   --setenv TERM    "${TERM:-xterm-256color}"
   --setenv PATH    "$SANDBOX_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
   --setenv ANTHROPIC_BASE_URL "http://127.0.0.1:$PORT_ANTHROPIC"
-  # Block all external HTTP/HTTPS traffic by default.
-  # 127.0.0.1 is listed in NO_PROXY so the Anthropic bridge is reached directly.
-  # When --enable-github is active, HTTPS_PROXY is overridden below to allow
-  # api.github.com through the host-side CONNECT proxy.
+  # All HTTPS traffic is routed through the host-side CONNECT proxy, which
+  # enforces the allowlist (empty by default; api.github.com added by --enable-github).
+  # 127.0.0.1 is in NO_PROXY so the Anthropic bridge is reached directly.
   --setenv HTTP_PROXY  ""
-  --setenv HTTPS_PROXY ""
+  --setenv HTTPS_PROXY "http://127.0.0.1:$PORT_GITHUB_CONNECT"
   --setenv ALL_PROXY   ""
   --setenv NO_PROXY    "127.0.0.1,localhost,::1"
 
   --chdir /workspace
 )
 
-# GitHub: gh CLI uses HTTPS to api.github.com. We route it through a host-side
-# CONNECT proxy (which has real internet access) that whitelists only api.github.com.
+# GitHub: gh CLI uses HTTPS to api.github.com. We route it through the host-side
+# CONNECT proxy (HTTPS_PROXY, always active). The proxy allowlist is empty unless
+# --enable-github is set, so api.github.com is blocked by default.
 # The real GH_TOKEN is passed directly since we can't inject into a TLS tunnel.
 if [[ "$ENABLE_GITHUB" == true ]]; then
   [[ -n "${GH_TOKEN:-}" ]] || { echo "❌ --enable-github requires GH_TOKEN to be set on the host"; exit 1; }
   BWRAP+=(
     --setenv GH_TOKEN     "$GH_TOKEN"
     --setenv GITHUB_TOKEN "$GH_TOKEN"
-    --setenv HTTPS_PROXY  "http://127.0.0.1:$PORT_GITHUB_CONNECT"
   )
 fi
 

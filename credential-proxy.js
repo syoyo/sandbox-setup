@@ -43,8 +43,8 @@ const DEFAULT_ANTHROPIC_SOCKET = '/tmp/claude-proxy-anthropic.sock';
 const DEFAULT_ANTHROPIC_PORT   = 58080;
 const DEFAULT_GITHUB_CONNECT_PORT = 58081;
 
-// Hosts the CONNECT proxy is allowed to tunnel to.
-const GITHUB_CONNECT_ALLOWLIST = ['api.github.com'];
+// Full allowlist when --enable-github is active.
+const GITHUB_ALLOWLIST = ['api.github.com'];
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -54,7 +54,8 @@ function parseArgs(argv) {
   const args = {
     anthropicSocket:     null,
     anthropicTcpPort:    null,
-    githubConnectPort:   null,   // HTTPS CONNECT proxy for api.github.com
+    githubConnectPort:   null,   // HTTPS CONNECT proxy port (always started)
+    enableGithub:        false,  // --enable-github: adds api.github.com to allowlist
     // Bridge-only mode
     bridgeOnly:    false,
     bridgeSocket:  null,
@@ -67,6 +68,7 @@ function parseArgs(argv) {
       case '--anthropic-socket':   args.anthropicSocket   = argv[++i]; break;
       case '--anthropic-tcp-port': args.anthropicTcpPort  = parseInt(argv[++i], 10); break;
       case '--github-connect-port':args.githubConnectPort = parseInt(argv[++i], 10); break;
+      case '--enable-github':      args.enableGithub = true; break;
       case '--bridge-only':        args.bridgeOnly = true; break;
       case '--socket':             args.bridgeSocket   = argv[++i]; break;
       case '--tcp-bridge-port':    args.bridgeTcpPort  = parseInt(argv[++i], 10); break;
@@ -341,7 +343,8 @@ function startConnectProxy(port, allowlist, verbose) {
   });
 
   server.listen(port, '127.0.0.1', () => {
-    console.log(`[github-connect] CONNECT proxy 127.0.0.1:${port}, allowlist: ${allowlist.join(', ')}`);
+    const desc = allowlist.length ? allowlist.join(', ') : '(none — all blocked)';
+    console.log(`[github-connect] CONNECT proxy 127.0.0.1:${port}, allowlist: ${desc}`);
   });
   server.on('error', (err) => { console.error('[github-connect] error:', err.message); process.exit(1); });
   return server;
@@ -377,7 +380,8 @@ if (args.bridgeOnly) {
   startTcpBridge(socketPath, tcpPort, 'anthropic');
 
   if (args.githubConnectPort) {
-    startConnectProxy(args.githubConnectPort, GITHUB_CONNECT_ALLOWLIST, args.verbose);
+    const allowlist = args.enableGithub ? GITHUB_ALLOWLIST : [];
+    startConnectProxy(args.githubConnectPort, allowlist, args.verbose);
   }
 
   const cleanup = () => { try { fs.unlinkSync(socketPath); } catch (_) {} process.exit(0); };
