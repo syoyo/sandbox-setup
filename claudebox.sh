@@ -78,6 +78,10 @@ ATTACH_MODE=false      # --attach: connect to existing sandbox
 NOTIFY_COMMAND=""      # shell command for event notifications
 NOTIFY_WEBHOOK=""      # webhook URL for event notifications (Slack, etc.)
 GH_TOKEN_FILE=""       # file containing GitHub PAT (alternative to GH_TOKEN env var)
+ALLOWLIST_URLS=()      # additional HTTPS hosts to whitelist via CONNECT proxy
+READONLY_WORKDIR=false # mount workdir read-only
+WALL_TIMEOUT=""        # wall-clock timeout in minutes
+DRY_RUN=false          # print bwrap command without executing
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -115,6 +119,15 @@ while [[ $# -gt 0 ]]; do
       # MED-1: only allow https webhooks to prevent SSRF to internal services.
       [[ "$2" =~ ^https:// ]] || { echo "❌ --notify-webhook: only https:// URLs allowed"; exit 1; }
       NOTIFY_WEBHOOK=$2; shift 2 ;;
+    --allowlist-url)
+      # Validate: must be a hostname (no scheme, no path, no port)
+      [[ "$2" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] || { echo "❌ --allowlist-url: invalid hostname '$2' (e.g. registry.npmjs.org)"; exit 1; }
+      ALLOWLIST_URLS+=("$2"); shift 2 ;;
+    --read-only-workdir) READONLY_WORKDIR=true; shift ;;
+    --timeout)
+      [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1 )) || { echo "❌ --timeout: invalid value '$2' (minutes, >= 1)"; exit 1; }
+      WALL_TIMEOUT=$2; shift 2 ;;
+    --dry-run)  DRY_RUN=true; shift ;;
     --anthropic-port)
       [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1024 && $2 <= 65535 )) || { echo "❌ --anthropic-port: invalid port '$2' (1024-65535)"; exit 1; }
       PORT_ANTHROPIC=$2; shift 2 ;;
@@ -152,6 +165,11 @@ OPTIONS:
   --gh-token-file FILE   Read GitHub PAT from FILE (default: ~/.config/claudebox/gh-token).
                          The GH_TOKEN env var takes priority if set.
   --mcp-port PORT        TCP port for MCP server bridge (default: 58082; range 1024-65535).
+  --allowlist-url HOST   Allow HTTPS access to HOST via CONNECT proxy. Repeatable.
+                         e.g. --allowlist-url registry.npmjs.org --allowlist-url pypi.org
+  --read-only-workdir    Mount workdir read-only (for analysis/review tasks).
+  --timeout MINS         Wall-clock timeout: kill sandbox after MINS minutes.
+  --dry-run              Print the bwrap command without executing it.
   --mem-limit SIZE       Memory limit (e.g. 4G, 512M). Uses cgroups via systemd-run.
   --cpu-limit PERCENT    CPU limit as percentage (100 = 1 core, 200 = 2 cores).
   --idle-timeout MINS    Warn when no Anthropic API request for MINS minutes (default: 15, 0=off).
@@ -336,6 +354,9 @@ if [[ "$ISOLATE_NET" == false ]]; then
   PROXY_ARGS+=(--github-connect-port "$PORT_GITHUB_CONNECT")
 fi
 [[ "$ENABLE_GITHUB" == true ]] && PROXY_ARGS+=(--enable-github)
+for _url in "${ALLOWLIST_URLS[@]+"${ALLOWLIST_URLS[@]}"}"; do
+  PROXY_ARGS+=(--connect-allowlist "$_url")
+done
 
 # GitHub MCP server: start on host, add reverse bridge args to proxy
 if [[ "$ENABLE_GITHUB_MCP" == true ]]; then
@@ -379,6 +400,10 @@ done
 [[ "$ENABLE_GITHUB_MCP" == true ]] && { [[ -S "$SOCKET_MCP" ]] || { echo "❌ MCP bridge socket did not appear"; exit 1; }; }
 _gh_desc="none"; [[ "$ENABLE_GITHUB" == true ]] && _gh_desc="api.github.com"
 [[ "$ENABLE_GITHUB_MCP" == true ]] && _gh_desc="${_gh_desc}+mcp"
+if [[ ${#ALLOWLIST_URLS[@]} -gt 0 ]]; then
+  _extra="${ALLOWLIST_URLS[*]}"
+  [[ "$_gh_desc" == "none" ]] && _gh_desc="$_extra" || _gh_desc="${_gh_desc},${_extra}"
+fi
 echo "✔ Proxy ready (anthropic=$SOCKET_ANTHROPIC, github=$SOCKET_GITHUB, allowlist=$_gh_desc)"
 
 # ---------------------------------------------------------------------------
@@ -502,8 +527,7 @@ BWRAP=(
   --tmpfs /home
   --dir "$SANDBOX_HOME"
 
-  # ---- Workdir — the ONLY read-write bind mount ----
-  --bind "$WORKDIR" /workspace
+  # ---- Workdir (added conditionally after array) ----
 
   # ---- Proxy sockets ----
   --ro-bind "$SOCKET_ANTHROPIC" "$SANDBOX_SOCKET_ANTHROPIC"
@@ -543,6 +567,13 @@ BWRAP=(
   --chdir /workspace
 )
 
+# Workdir bind mount: rw by default, ro with --read-only-workdir
+if [[ "$READONLY_WORKDIR" == true ]]; then
+  BWRAP+=(--ro-bind "$WORKDIR" /workspace)
+else
+  BWRAP+=(--bind "$WORKDIR" /workspace)
+fi
+
 # GitHub: real GH_TOKEN passed directly (TLS tunnel prevents proxy injection).
 # HTTPS_PROXY routes gh CLI through the CONNECT proxy (allowlist enforced there).
 if [[ "$ENABLE_GITHUB" == true ]]; then
@@ -552,6 +583,12 @@ if [[ "$ENABLE_GITHUB" == true ]]; then
     --setenv GITHUB_TOKEN "$GH_TOKEN"
     --setenv HTTPS_PROXY  "http://127.0.0.1:$PORT_GITHUB_CONNECT"
   )
+fi
+
+# Set HTTPS_PROXY when --allowlist-url is used (even without --enable-github)
+# so tools inside sandbox can reach the allowed hosts.
+if [[ ${#ALLOWLIST_URLS[@]} -gt 0 && "$ENABLE_GITHUB" != true ]]; then
+  BWRAP+=(--setenv HTTPS_PROXY "http://127.0.0.1:$PORT_GITHUB_CONNECT")
 fi
 
 # GitHub MCP server: bind-mount the reverse bridge socket and pass config vars
@@ -713,11 +750,22 @@ oom_check() {
 # All runtime values are injected via --setenv above (_PROXY_SOCK, _PROXY_PORT,
 # _ISOLATE_NET, _LAUNCH_SHELL) and referenced as $VAR — never interpolated here.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Wall-clock timeout wrapper
+# ---------------------------------------------------------------------------
+TIMEOUT_WRAPPER=()
+if [[ -n "$WALL_TIMEOUT" ]]; then
+  command -v timeout >/dev/null 2>&1 || { echo "❌ timeout command required for --timeout"; exit 1; }
+  TIMEOUT_WRAPPER=(timeout --signal=TERM --kill-after=30 "${WALL_TIMEOUT}m")
+  echo "✔ Wall-clock timeout: ${WALL_TIMEOUT} minutes"
+fi
+
 NET_DESC="$([[ "$ISOLATE_NET" == true ]] && echo "isolated (loopback + socket bridges)" || echo "shared host network")"
-echo "▶ Launching sandbox (workdir: $WORKDIR, network: $NET_DESC)"
+_rw_desc="$([[ "$READONLY_WORKDIR" == true ]] && echo "read-only" || echo "read-write")"
+echo "▶ Launching sandbox (workdir: $WORKDIR [$_rw_desc], network: $NET_DESC)"
 echo "  Attach from another terminal: $0 --attach"
 echo "  Attach socket: $ATTACH_SOCK"
-notify sandbox_start ":rocket: Sandbox started — workdir: \`$(basename "$WORKDIR")\`, network: $NET_DESC, PID: $$"
+notify sandbox_start ":rocket: Sandbox started — workdir: \`$(basename "$WORKDIR")\` [$_rw_desc], network: $NET_DESC, PID: $$"
 
 SANDBOX_INIT_SCRIPT='
   set -euo pipefail
@@ -810,21 +858,50 @@ MCPEOF
   fi
 '
 
+# ---------------------------------------------------------------------------
+# Dry-run: print the full command and exit
+# ---------------------------------------------------------------------------
+if [[ "$DRY_RUN" == true ]]; then
+  echo "# --- dry-run: bwrap command ---"
+  _cmd=()
+  [[ ${#TIMEOUT_WRAPPER[@]} -gt 0 ]] && _cmd+=("${TIMEOUT_WRAPPER[@]}")
+  [[ ${#RESOURCE_WRAPPER[@]} -gt 0 ]] && _cmd+=("${RESOURCE_WRAPPER[@]}")
+  _cmd+=("${BWRAP[@]}" -- bash -c '<SANDBOX_INIT_SCRIPT>' -- "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}")
+  printf '%q ' "${_cmd[@]}"
+  echo ""
+  echo ""
+  echo "# --- sandbox init script ---"
+  echo "$SANDBOX_INIT_SCRIPT"
+  exit 0
+fi
+
+# Timeout exit code check — called after sandbox exits
+timeout_check() {
+  local exit_code=$1
+  if [[ -n "$WALL_TIMEOUT" && $exit_code -eq 124 ]]; then
+    echo ""
+    echo "⚠ SANDBOX TIMED OUT — wall-clock limit (${WALL_TIMEOUT}m) reached"
+    notify wall_timeout ":alarm_clock: Sandbox timed out — wall-clock limit (${WALL_TIMEOUT}m) reached (workdir: \`$(basename "$WORKDIR")\`)"
+  fi
+}
+
 # When resource limits are set, run sandbox in background and wait so the
 # parent script (outside the cgroup) survives to detect OOM kills.
 if [[ ${#RESOURCE_WRAPPER[@]} -gt 0 ]]; then
-  "${RESOURCE_WRAPPER[@]}" "${BWRAP[@]}" -- bash -c "$SANDBOX_INIT_SCRIPT" -- "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}" &
+  "${TIMEOUT_WRAPPER[@]+"${TIMEOUT_WRAPPER[@]}"}" "${RESOURCE_WRAPPER[@]}" "${BWRAP[@]}" -- bash -c "$SANDBOX_INIT_SCRIPT" -- "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}" &
   SANDBOX_PID=$!
   # Forward signals to the sandbox
   trap 'kill -TERM $SANDBOX_PID 2>/dev/null; wait $SANDBOX_PID 2>/dev/null; cleanup' INT TERM
   wait $SANDBOX_PID 2>/dev/null
   SANDBOX_EXIT=$?
   oom_check $SANDBOX_EXIT
+  timeout_check $SANDBOX_EXIT
   notify sandbox_exit ":stop_sign: Sandbox exited (code: $SANDBOX_EXIT, workdir: \`$(basename "$WORKDIR")\`)"
   exit $SANDBOX_EXIT
 else
-  "${BWRAP[@]}" -- bash -c "$SANDBOX_INIT_SCRIPT" -- "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}"
+  "${TIMEOUT_WRAPPER[@]+"${TIMEOUT_WRAPPER[@]}"}" "${BWRAP[@]}" -- bash -c "$SANDBOX_INIT_SCRIPT" -- "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}"
   SANDBOX_EXIT=$?
+  timeout_check $SANDBOX_EXIT
   notify sandbox_exit ":stop_sign: Sandbox exited (code: $SANDBOX_EXIT, workdir: \`$(basename "$WORKDIR")\`)"
   exit $SANDBOX_EXIT
 fi

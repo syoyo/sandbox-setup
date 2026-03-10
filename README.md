@@ -96,6 +96,12 @@ GH_TOKEN=ghp_xxx ./claudebox.sh --enable-github
 # With resource limits
 ./claudebox.sh --mem-limit 4G --cpu-limit 400
 
+# Read-only analysis with timeout
+./claudebox.sh --read-only-workdir --timeout 30 --workdir ~/projects/myapp -- -p "review this code"
+
+# Preview the sandbox command without running it
+./claudebox.sh --dry-run --workdir ~/projects/myapp
+
 # Full example
 ./claudebox.sh \
   --workdir ~/projects/myapp \
@@ -130,6 +136,11 @@ GH_TOKEN=ghp_xxx ./claudebox.sh --enable-github
 --idle-timeout MINS    Warn when no Anthropic API request for MINS minutes (default: 15, 0=off).
 --notify-webhook URL   POST JSON on events (Slack incoming webhook compatible).
 --notify-command CMD   Run CMD on events (env: CLAUDEBOX_EVENT, CLAUDEBOX_MESSAGE).
+--allowlist-url HOST   Allow HTTPS access to HOST via CONNECT proxy. Repeatable.
+                       e.g. --allowlist-url registry.npmjs.org --allowlist-url pypi.org
+--read-only-workdir    Mount workdir read-only (for analysis/review tasks).
+--timeout MINS         Wall-clock timeout in minutes. Kills sandbox after MINS minutes.
+--dry-run              Print the full bwrap command without executing it.
 --anthropic-port PORT  TCP port for Anthropic proxy bridge (default: 58080).
 --github-port PORT     TCP port for GitHub CONNECT proxy bridge (default: 58081).
 --help                 Show help.
@@ -388,6 +399,56 @@ The command receives event details via environment variables:
 
 See `examples/notify-slack.sh` for a full Slack notification script with color-coded
 attachments per event type.
+
+## URL Allowlist
+
+By default, the sandbox can only reach Anthropic's API. Use `--allowlist-url` to allow
+additional HTTPS hosts through the CONNECT proxy:
+
+```bash
+# Allow npm registry and PyPI
+./claudebox.sh --allowlist-url registry.npmjs.org --allowlist-url pypi.org --workdir work
+
+# Combine with GitHub MCP
+./claudebox.sh --enable-github-mcp --allowlist-url registry.npmjs.org --workdir work
+```
+
+Each allowed host is added to the CONNECT proxy's hostname allowlist. Only port 443
+(HTTPS) is permitted. `HTTPS_PROXY` is automatically set in the sandbox.
+
+## Read-Only Workdir
+
+Mount the working directory read-only for analysis or code review tasks where
+the sandbox should not modify files:
+
+```bash
+./claudebox.sh --read-only-workdir --workdir ~/projects/myapp -- -p "review this codebase"
+```
+
+## Wall-Clock Timeout
+
+Kill the sandbox after a fixed duration to prevent runaway sessions:
+
+```bash
+# Kill after 60 minutes
+./claudebox.sh --timeout 60 --workdir ~/projects/myapp
+
+# Combine with notifications
+./claudebox.sh --timeout 30 --notify-webhook https://hooks.slack.com/... --workdir work
+```
+
+When the timeout fires, the sandbox receives `SIGTERM` followed by `SIGKILL` after
+30 seconds. A `wall_timeout` notification is sent if webhooks/commands are configured.
+
+## Dry Run
+
+Print the full `bwrap` command and init script without launching the sandbox:
+
+```bash
+./claudebox.sh --dry-run --workdir work
+```
+
+Useful for debugging sandbox configuration or generating commands for automation.
 
 ## Sandbox Security Properties
 

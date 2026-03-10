@@ -75,6 +75,7 @@ function parseArgs(argv) {
     githubConnectPort: null,
     githubSocket:      null,
     enableGithub:      false,
+    connectAllowlist:  [],     // additional CONNECT proxy hostnames
     idleTimeout:       0,       // minutes; 0 = disabled
     notifyCommand:     null,
     notifyWebhook:     null,
@@ -101,6 +102,7 @@ function parseArgs(argv) {
       // HIGH-3: bearer token read from MCP_BEARER_TOKEN env var (not CLI) to avoid /proc leak.
       // --mcp-bearer-token kept for backwards compat but env var is preferred.
       case '--mcp-bearer-token':   args.mcpBearerToken = argv[++i]; break;
+      case '--connect-allowlist':   args.connectAllowlist.push(argv[++i]); break;
       case '--enable-github':       args.enableGithub = true; break;
       case '--bridge-only':         args.bridgeOnly = true; break;
       case '--socket':              args.bridgeSocket  = argv[++i]; break;
@@ -615,7 +617,10 @@ if (args.bridgeOnly) {
 
   startTcpBridge(socketPath, tcpPort, 'anthropic');
 
-  const allowlist = args.enableGithub ? GITHUB_ALLOWLIST : [];
+  const allowlist = [
+    ...(args.enableGithub ? GITHUB_ALLOWLIST : []),
+    ...args.connectAllowlist,
+  ];
   if (args.githubConnectPort) {
     startConnectProxy(args.githubConnectPort, allowlist, args.verbose);
   }
