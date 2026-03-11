@@ -96,6 +96,9 @@ GH_TOKEN=ghp_xxx ./claudebox.sh --enable-github
 # With resource limits
 ./claudebox.sh --mem-limit 4G --cpu-limit 400
 
+# Snapshot mode: review changes before applying (rollback-safe)
+./claudebox.sh --snapshot --workdir ~/projects/myapp
+
 # Read-only analysis with timeout
 ./claudebox.sh --read-only-workdir --timeout 30 --workdir ~/projects/myapp -- -p "review this code"
 
@@ -139,6 +142,8 @@ GH_TOKEN=ghp_xxx ./claudebox.sh --enable-github
 --allowlist-url HOST   Allow HTTPS access to HOST via CONNECT proxy. Repeatable.
                        e.g. --allowlist-url registry.npmjs.org --allowlist-url pypi.org
 --read-only-workdir    Mount workdir read-only (for analysis/review tasks).
+--snapshot             Snapshot mode: copy workdir to staging, sandbox writes to copy.
+                       On exit: review diff, then apply or rollback. Original untouched.
 --timeout MINS         Wall-clock timeout in minutes. Kills sandbox after MINS minutes.
 --dry-run              Print the full bwrap command without executing it.
 --anthropic-port PORT  TCP port for Anthropic proxy bridge (default: 58080).
@@ -399,6 +404,38 @@ The command receives event details via environment variables:
 
 See `examples/notify-slack.sh` for a full Slack notification script with color-coded
 attachments per event type.
+
+## Snapshot Mode
+
+Run the sandbox with `--snapshot` to protect your workdir from unwanted changes.
+The original workdir is copied to a staging directory before launch; the sandbox
+writes to the staging copy while the original remains untouched.
+
+```bash
+./claudebox.sh --snapshot --workdir ~/projects/myapp
+```
+
+On exit, you see a summary of changes and choose what to do:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SNAPSHOT CHANGES (3 differences)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Only in staging: new-file.ts
+  Files src/index.ts and staging/src/index.ts differ
+  Only in original: deleted-file.ts
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Apply changes to workdir? [y]es / [n]o (rollback) / [d]iff:
+```
+
+- **y**: Apply all changes from staging to the original workdir (`rsync --delete`)
+- **n**: Rollback — discard staging, original untouched
+- **d**: View full `diff -ru` before deciding
+
+**Performance**: Snapshot creation copies the entire workdir (`cp -a`), so it's
+best for repos under ~1 GB. See `doc/filesystem.md` for design notes and
+alternative approaches considered (overlayfs, btrfs, ZFS).
 
 ## URL Allowlist
 

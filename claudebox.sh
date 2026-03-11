@@ -82,6 +82,8 @@ ALLOWLIST_URLS=()      # additional HTTPS hosts to whitelist via CONNECT proxy
 READONLY_WORKDIR=false # mount workdir read-only
 WALL_TIMEOUT=""        # wall-clock timeout in minutes
 DRY_RUN=false          # print bwrap command without executing
+SNAPSHOT=false         # overlayfs snapshot mode
+OVERLAY_DIR=""         # host-side overlay directory (auto-created)
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -124,6 +126,7 @@ while [[ $# -gt 0 ]]; do
       [[ "$2" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] || { echo "❌ --allowlist-url: invalid hostname '$2' (e.g. registry.npmjs.org)"; exit 1; }
       ALLOWLIST_URLS+=("$2"); shift 2 ;;
     --read-only-workdir) READONLY_WORKDIR=true; shift ;;
+    --snapshot) SNAPSHOT=true; shift ;;
     --timeout)
       [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1 )) || { echo "❌ --timeout: invalid value '$2' (minutes, >= 1)"; exit 1; }
       WALL_TIMEOUT=$2; shift 2 ;;
@@ -168,6 +171,9 @@ OPTIONS:
   --allowlist-url HOST   Allow HTTPS access to HOST via CONNECT proxy. Repeatable.
                          e.g. --allowlist-url registry.npmjs.org --allowlist-url pypi.org
   --read-only-workdir    Mount workdir read-only (for analysis/review tasks).
+  --snapshot             Snapshot mode: copy workdir to staging before launch.
+                         Sandbox writes to staging copy; original untouched.
+                         On exit: review diff, then apply or rollback.
   --timeout MINS         Wall-clock timeout: kill sandbox after MINS minutes.
   --dry-run              Print the bwrap command without executing it.
   --mem-limit SIZE       Memory limit (e.g. 4G, 512M). Uses cgroups via systemd-run.
@@ -263,6 +269,44 @@ WORKDIR=$(realpath --canonicalize-existing "$WORKDIR" 2>/dev/null) || {
 [[ "$WORKDIR" == "/" ]]     && { echo "❌ --workdir cannot be /";     exit 1; }
 [[ "$WORKDIR" == "$HOME" ]] && { echo "❌ --workdir cannot be \$HOME"; exit 1; }
 
+# --snapshot and --read-only-workdir are mutually exclusive
+[[ "$SNAPSHOT" == true && "$READONLY_WORKDIR" == true ]] && {
+  echo "❌ --snapshot and --read-only-workdir are mutually exclusive"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Snapshot: copy workdir to staging area (sandbox writes to staging, original safe)
+# ---------------------------------------------------------------------------
+SNAPSHOT_STAGING=""
+_SNAPSHOT_PHASE=""  # "copy" | "sandbox" | "merge" — used by cleanup to decide staging fate
+if [[ "$SNAPSHOT" == true ]]; then
+  # LOW-3: warn if workdir is large (> 1 GB)
+  _workdir_size_kb=$(du -sk "$WORKDIR" 2>/dev/null | cut -f1)
+  if [[ "${_workdir_size_kb:-0}" -gt 1048576 ]]; then
+    _workdir_size_human=$(du -sh "$WORKDIR" 2>/dev/null | cut -f1)
+    echo "⚠ Workdir is ${_workdir_size_human} — snapshot will copy the entire directory."
+    echo -n "  Continue? [y/n]: "
+    read -r _confirm </dev/tty 2>/dev/null || _confirm="y"
+    [[ "$_confirm" =~ ^[Yy] ]] || { echo "Aborted."; exit 0; }
+  fi
+
+  _SNAPSHOT_PHASE="copy"
+  # MED-2: enforce umask before mktemp to prevent TOCTOU permission window
+  # Use a directory next to the workdir to stay on the same filesystem (faster cp, same partition)
+  SNAPSHOT_STAGING=$(umask 077; mktemp -d "${WORKDIR%/*}/.claudebox-snapshot-XXXXXX")
+  echo "▶ Snapshot: copying workdir to staging..."
+  # MED-6: --no-preserve=ownership avoids failure on files owned by other users
+  if ! cp -a --no-preserve=ownership "$WORKDIR/." "$SNAPSHOT_STAGING/"; then
+    echo "❌ Snapshot copy failed — aborting"
+    rm -rf "$SNAPSHOT_STAGING" 2>/dev/null || true
+    exit 1
+  fi
+  echo "✔ Snapshot staging: $SNAPSHOT_STAGING ($(du -sh "$SNAPSHOT_STAGING" 2>/dev/null | cut -f1))"
+
+  # MED-4: save workdir state fingerprint to detect concurrent modifications
+  find "$WORKDIR" -not -path "$SNAPSHOT_STAGING*" -printf '%P %T@ %s\n' 2>/dev/null | sort > "$SNAPSHOT_STAGING/.claudebox-manifest"
+  _SNAPSHOT_PHASE="sandbox"
+fi
+
 # ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
@@ -275,6 +319,22 @@ cleanup() {
   [[ -n "$TEMP_CREDS" && -f "$TEMP_CREDS" && -z "$DUMMY_CREDS_FILE" ]] && rm -f "$TEMP_CREDS" || true
   # HIGH-4: clean up private temp dir if we created it
   [[ "${_SOCK_DIR_CREATED:-}" == true ]] && rm -rf "$_SOCK_DIR" 2>/dev/null || true
+  # MED-7: snapshot staging handling depends on phase:
+  # - "copy" phase (cp in progress): clean up partial staging
+  # - "sandbox" phase (sandbox running): clean up staging (sandbox was interrupted, no useful changes)
+  # - "merge" phase (user at merge prompt): PRESERVE staging so user can recover changes
+  if [[ -n "${SNAPSHOT_STAGING:-}" && -d "$SNAPSHOT_STAGING" && "${_SNAPSHOT_MERGED:-}" != true ]]; then
+    if [[ "${_SNAPSHOT_PHASE:-}" == "merge" ]]; then
+      echo ""
+      echo "⚠ Snapshot staging PRESERVED (interrupted during merge):"
+      echo "  $SNAPSHOT_STAGING"
+      echo "  To apply:   rsync -aH --delete '$SNAPSHOT_STAGING/' '$WORKDIR/'"
+      echo "  To discard: rm -rf '$SNAPSHOT_STAGING'"
+    else
+      echo "⚠ Snapshot not merged — cleaning up staging: $SNAPSHOT_STAGING"
+      rm -rf "$SNAPSHOT_STAGING" 2>/dev/null || true
+    fi
+  fi
   exit $code
 }
 trap cleanup INT TERM EXIT
@@ -567,8 +627,11 @@ BWRAP=(
   --chdir /workspace
 )
 
-# Workdir bind mount: rw by default, ro with --read-only-workdir
-if [[ "$READONLY_WORKDIR" == true ]]; then
+# Workdir bind mount: snapshot (staging copy), ro, or rw
+if [[ "$SNAPSHOT" == true ]]; then
+  # Snapshot: bind the staging copy (rw), original workdir untouched
+  BWRAP+=(--bind "$SNAPSHOT_STAGING" /workspace)
+elif [[ "$READONLY_WORKDIR" == true ]]; then
   BWRAP+=(--ro-bind "$WORKDIR" /workspace)
 else
   BWRAP+=(--bind "$WORKDIR" /workspace)
@@ -761,7 +824,9 @@ if [[ -n "$WALL_TIMEOUT" ]]; then
 fi
 
 NET_DESC="$([[ "$ISOLATE_NET" == true ]] && echo "isolated (loopback + socket bridges)" || echo "shared host network")"
-_rw_desc="$([[ "$READONLY_WORKDIR" == true ]] && echo "read-only" || echo "read-write")"
+if [[ "$SNAPSHOT" == true ]]; then _rw_desc="snapshot"
+elif [[ "$READONLY_WORKDIR" == true ]]; then _rw_desc="read-only"
+else _rw_desc="read-write"; fi
 echo "▶ Launching sandbox (workdir: $WORKDIR [$_rw_desc], network: $NET_DESC)"
 echo "  Attach from another terminal: $0 --attach"
 echo "  Attach socket: $ATTACH_SOCK"
@@ -872,6 +937,9 @@ if [[ "$DRY_RUN" == true ]]; then
   echo ""
   echo "# --- sandbox init script ---"
   echo "$SANDBOX_INIT_SCRIPT"
+  # Clean up snapshot staging created for dry-run inspection
+  [[ -n "${SNAPSHOT_STAGING:-}" && -d "$SNAPSHOT_STAGING" ]] && rm -rf "$SNAPSHOT_STAGING"
+  _SNAPSHOT_MERGED=true  # prevent cleanup from warning
   exit 0
 fi
 
@@ -885,6 +953,104 @@ timeout_check() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Snapshot merge — review overlay changes and apply or rollback
+# ---------------------------------------------------------------------------
+snapshot_merge() {
+  [[ "$SNAPSHOT" != true ]] && return 0
+  [[ ! -d "$SNAPSHOT_STAGING" ]] && return 0
+
+  # Mark merge phase so cleanup preserves staging on signal (MED-7)
+  _SNAPSHOT_PHASE="merge"
+
+  # Compare staging (modified by sandbox) against original workdir
+  # Exclude the manifest file from diff
+  local _diff_summary
+  _diff_summary=$(diff -rq "$WORKDIR" "$SNAPSHOT_STAGING" --exclude='.claudebox-manifest' 2>/dev/null) || true
+
+  if [[ -z "$_diff_summary" ]]; then
+    echo ""
+    echo "✔ Snapshot: no changes detected — nothing to merge."
+    _SNAPSHOT_MERGED=true
+    rm -rf "$SNAPSHOT_STAGING" 2>/dev/null || true
+    return 0
+  fi
+
+  local change_count
+  change_count=$(echo "$_diff_summary" | wc -l)
+
+  # MED-4: detect concurrent modifications to original workdir
+  local _concurrent_warning=""
+  if [[ -f "$SNAPSHOT_STAGING/.claudebox-manifest" ]]; then
+    local _current_manifest
+    _current_manifest=$(find "$WORKDIR" -not -path "$SNAPSHOT_STAGING*" -printf '%P %T@ %s\n' 2>/dev/null | sort)
+    local _saved_manifest
+    _saved_manifest=$(cat "$SNAPSHOT_STAGING/.claudebox-manifest" 2>/dev/null)
+    if [[ "$_current_manifest" != "$_saved_manifest" ]]; then
+      _concurrent_warning="  ⚠ WARNING: Original workdir was modified while sandbox was running!
+    Applying changes may overwrite those modifications."
+    fi
+  fi
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  SNAPSHOT CHANGES ($change_count differences)"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  [[ -n "$_concurrent_warning" ]] && echo "$_concurrent_warning" && echo ""
+  echo "$_diff_summary" | head -30 | sed 's/^/  /'
+  [[ $change_count -gt 30 ]] && echo "  ... and $((change_count - 30)) more"
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  # Prompt user
+  while true; do
+    echo -n "  Apply changes to workdir? [y]es / [n]o (rollback) / [d]iff: "
+    read -r _answer </dev/tty || _answer="n"
+    case "$_answer" in
+      y|yes|Y|YES)
+        echo "  Applying changes..."
+        # Remove manifest before merge
+        rm -f "$SNAPSHOT_STAGING/.claudebox-manifest" 2>/dev/null || true
+        # MED-5: --hard-links preserves hardlinks; HIGH-4: check rsync exit code
+        if rsync -aH --delete "$SNAPSHOT_STAGING/" "$WORKDIR/"; then
+          echo "  ✔ Changes applied to $WORKDIR"
+          _SNAPSHOT_MERGED=true
+          rm -rf "$SNAPSHOT_STAGING" 2>/dev/null || true
+          notify snapshot_apply ":white_check_mark: Snapshot changes applied to \`$(basename "$WORKDIR")\` ($change_count differences)"
+        else
+          # HIGH-4: rsync failed — preserve staging for manual recovery
+          echo ""
+          echo "  ❌ rsync failed — workdir may be in an inconsistent state!"
+          echo "  Staging preserved for manual recovery:"
+          echo "    $SNAPSHOT_STAGING"
+          echo "  To retry:   rsync -aH --delete '$SNAPSHOT_STAGING/' '$WORKDIR/'"
+          echo "  To discard: rm -rf '$SNAPSHOT_STAGING'"
+          _SNAPSHOT_MERGED=true  # prevent cleanup from deleting staging
+          notify snapshot_error ":x: Snapshot merge failed — staging preserved at $SNAPSHOT_STAGING"
+        fi
+        return 0
+        ;;
+      n|no|N|NO)
+        echo "  ✔ Rollback — original workdir unchanged."
+        _SNAPSHOT_MERGED=true
+        rm -rf "$SNAPSHOT_STAGING" 2>/dev/null || true
+        notify snapshot_rollback ":rewind: Snapshot rolled back — \`$(basename "$WORKDIR")\` unchanged ($change_count changes discarded)"
+        return 0
+        ;;
+      d|diff|D|DIFF)
+        if command -v diff >/dev/null 2>&1; then
+          diff -ru "$WORKDIR" "$SNAPSHOT_STAGING" --exclude='.claudebox-manifest' 2>/dev/null | "${PAGER:-less}" || true
+        else
+          echo "  (diff not available)"
+        fi
+        ;;
+      *)
+        echo "  Please answer y, n, or d."
+        ;;
+    esac
+  done
+}
+
 # When resource limits are set, run sandbox in background and wait so the
 # parent script (outside the cgroup) survives to detect OOM kills.
 if [[ ${#RESOURCE_WRAPPER[@]} -gt 0 ]]; then
@@ -896,12 +1062,14 @@ if [[ ${#RESOURCE_WRAPPER[@]} -gt 0 ]]; then
   SANDBOX_EXIT=$?
   oom_check $SANDBOX_EXIT
   timeout_check $SANDBOX_EXIT
+  snapshot_merge
   notify sandbox_exit ":stop_sign: Sandbox exited (code: $SANDBOX_EXIT, workdir: \`$(basename "$WORKDIR")\`)"
   exit $SANDBOX_EXIT
 else
   "${TIMEOUT_WRAPPER[@]+"${TIMEOUT_WRAPPER[@]}"}" "${BWRAP[@]}" -- bash -c "$SANDBOX_INIT_SCRIPT" -- "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}"
   SANDBOX_EXIT=$?
   timeout_check $SANDBOX_EXIT
+  snapshot_merge
   notify sandbox_exit ":stop_sign: Sandbox exited (code: $SANDBOX_EXIT, workdir: \`$(basename "$WORKDIR")\`)"
   exit $SANDBOX_EXIT
 fi
