@@ -120,7 +120,9 @@ if [[ -n "$_profile_name" ]]; then
     _line="${_line#"${_line%%[![:space:]]*}"}"  # trim leading
     _line="${_line%"${_line##*[![:space:]]}"}"  # trim trailing
     [[ -z "$_line" ]] && continue
-    # Split line into words safely (no eval)
+    # Split line into words safely (no eval).
+    # NOTE: read -ra splits on whitespace; quoted values like --workdir "/path with spaces" are NOT supported.
+    # Use one option per line if values contain spaces.
     read -ra _words <<< "$_line"
     _profile_args+=("${_words[@]}")
   done < "$_profile_file"

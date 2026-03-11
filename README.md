@@ -680,6 +680,9 @@ Profiles let you save commonly-used option combinations in a config file:
 Profiles are stored at `~/.config/claudebox/profiles/NAME.conf` — one option per line,
 `#` comments allowed. Example profiles are in `examples/profiles/`.
 
+**Note:** Options are split on whitespace; quoted values (e.g., `--workdir "/path with spaces"`)
+are not supported. Put one option per line and avoid spaces in paths.
+
 Example `review.conf`:
 ```
 # Read-only code review with security hardening
