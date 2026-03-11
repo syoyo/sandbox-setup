@@ -145,6 +145,8 @@ GH_TOKEN=ghp_xxx ./claudebox.sh --enable-github
 --snapshot             Snapshot mode: copy workdir to staging, sandbox writes to copy.
                        On exit: review diff, then apply or rollback. Original untouched.
 --timeout MINS         Wall-clock timeout in minutes. Kills sandbox after MINS minutes.
+--token-limit N        Max tokens (input+output). Proxy rejects new requests after limit.
+--audit-log FILE       Log API requests (method, path, tokens, timing) to JSONL file.
 --dry-run              Print the full bwrap command without executing it.
 --anthropic-port PORT  TCP port for Anthropic proxy bridge (default: 58080).
 --github-port PORT     TCP port for GitHub CONNECT proxy bridge (default: 58081).
@@ -486,6 +488,83 @@ Print the full `bwrap` command and init script without launching the sandbox:
 ```
 
 Useful for debugging sandbox configuration or generating commands for automation.
+
+## Token Budget
+
+Track and limit API token usage to prevent runaway costs:
+
+```bash
+# Kill after 500K tokens
+./claudebox.sh --token-limit 500000 --workdir ~/projects/myapp
+
+# With notifications
+./claudebox.sh --token-limit 1000000 --notify-webhook https://hooks.slack.com/... --workdir work
+```
+
+The proxy parses Anthropic API response bodies to extract `usage.input_tokens` and
+`usage.output_tokens`. When the cumulative total exceeds `--token-limit`, new requests
+are rejected with HTTP 429. A `token_limit` notification is sent. A session summary
+is printed when the proxy exits:
+
+```
+[tokens] Session total: 45,230 tokens (12,100 in + 33,130 out) across 8 requests
+```
+
+## Audit Log
+
+Log all API requests to a JSONL file for post-session review:
+
+```bash
+./claudebox.sh --audit-log ~/claudebox-audit.jsonl --workdir ~/projects/myapp
+```
+
+Each line is a JSON object:
+
+```json
+{"ts":"2025-01-15T10:30:00.000Z","event":"api_request","method":"POST","path":"/v1/messages","status":200,"duration_ms":1234,"input_tokens":500,"output_tokens":1200,"cumulative_tokens":1700}
+```
+
+Events: `proxy_start`, `api_request`, `api_error`, `token_limit_exceeded`, `proxy_stop`.
+
+## Diff-on-Exit
+
+When the workdir is a git repository, a change summary is automatically shown after
+the sandbox exits:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  WORKDIR CHANGES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   src/index.ts | 12 ++++++------
+   1 file changed, 6 insertions(+), 6 deletions(-)
+
+  Untracked files (2):
+    src/new-feature.ts
+    tests/new-feature.test.ts
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+Skipped for `--snapshot` (which has its own diff) and `--read-only-workdir`.
+
+## Filesystem Quarantine
+
+After sandbox exit, files are scanned for suspicious patterns:
+
+- Shell scripts containing network commands (`curl`, `wget`, `nc`, `socat`)
+- Dotfiles (`.bashrc`, `.profile`, `.zshrc`) — potential persistence
+- Long base64-encoded strings — potential encoded secrets
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  QUARANTINE SCAN (2 findings)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ⚠ Script with network commands: deploy.sh
+  ⚠ Possible encoded secret: config/auth.json
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+The scan runs automatically. A `quarantine_warning` notification is sent if findings
+are detected. This is informational — files are not blocked or deleted.
 
 ## Sandbox Security Properties
 

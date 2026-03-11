@@ -84,6 +84,8 @@ WALL_TIMEOUT=""        # wall-clock timeout in minutes
 DRY_RUN=false          # print bwrap command without executing
 SNAPSHOT=false         # overlayfs snapshot mode
 OVERLAY_DIR=""         # host-side overlay directory (auto-created)
+TOKEN_LIMIT=""         # max tokens (input+output); empty = unlimited
+AUDIT_LOG=""           # path to audit log file
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -131,6 +133,11 @@ while [[ $# -gt 0 ]]; do
       [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1 )) || { echo "❌ --timeout: invalid value '$2' (minutes, >= 1)"; exit 1; }
       WALL_TIMEOUT=$2; shift 2 ;;
     --dry-run)  DRY_RUN=true; shift ;;
+    --token-limit)
+      [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1000 )) || { echo "❌ --token-limit: invalid value '$2' (minimum 1000)"; exit 1; }
+      TOKEN_LIMIT=$2; shift 2 ;;
+    --audit-log)
+      AUDIT_LOG=$2; shift 2 ;;
     --anthropic-port)
       [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1024 && $2 <= 65535 )) || { echo "❌ --anthropic-port: invalid port '$2' (1024-65535)"; exit 1; }
       PORT_ANTHROPIC=$2; shift 2 ;;
@@ -175,6 +182,8 @@ OPTIONS:
                          Sandbox writes to staging copy; original untouched.
                          On exit: review diff, then apply or rollback.
   --timeout MINS         Wall-clock timeout: kill sandbox after MINS minutes.
+  --token-limit N        Max tokens (input+output). Proxy rejects requests after limit.
+  --audit-log FILE       Log API requests (method, path, tokens, timing) to JSONL file.
   --dry-run              Print the bwrap command without executing it.
   --mem-limit SIZE       Memory limit (e.g. 4G, 512M). Uses cgroups via systemd-run.
   --cpu-limit PERCENT    CPU limit as percentage (100 = 1 core, 200 = 2 cores).
@@ -417,6 +426,8 @@ fi
 for _url in "${ALLOWLIST_URLS[@]+"${ALLOWLIST_URLS[@]}"}"; do
   PROXY_ARGS+=(--connect-allowlist "$_url")
 done
+[[ -n "$TOKEN_LIMIT" ]] && PROXY_ARGS+=(--token-limit "$TOKEN_LIMIT")
+[[ -n "$AUDIT_LOG" ]] && PROXY_ARGS+=(--audit-log "$AUDIT_LOG")
 
 # GitHub MCP server: start on host, add reverse bridge args to proxy
 if [[ "$ENABLE_GITHUB_MCP" == true ]]; then
@@ -954,7 +965,92 @@ timeout_check() {
 }
 
 # ---------------------------------------------------------------------------
-# Snapshot merge — review overlay changes and apply or rollback
+# Diff-on-exit: show git diff --stat if workdir is a git repo
+# ---------------------------------------------------------------------------
+diff_on_exit() {
+  # Skip for snapshot mode (snapshot_merge handles its own diff)
+  [[ "$SNAPSHOT" == true ]] && return 0
+  # Skip for read-only workdir (no changes possible)
+  [[ "$READONLY_WORKDIR" == true ]] && return 0
+
+  # Only if workdir is a git repo
+  if [[ -d "$WORKDIR/.git" ]] || git -C "$WORKDIR" rev-parse --git-dir &>/dev/null; then
+    local _stat
+    _stat=$(git -C "$WORKDIR" diff --stat 2>/dev/null) || true
+    local _untracked
+    _untracked=$(git -C "$WORKDIR" ls-files --others --exclude-standard 2>/dev/null | head -20) || true
+
+    if [[ -n "$_stat" || -n "$_untracked" ]]; then
+      echo ""
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "  WORKDIR CHANGES"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      if [[ -n "$_stat" ]]; then
+        echo "$_stat" | sed 's/^/  /'
+      fi
+      if [[ -n "$_untracked" ]]; then
+        local _ucount
+        _ucount=$(git -C "$WORKDIR" ls-files --others --exclude-standard 2>/dev/null | wc -l)
+        echo ""
+        echo "  Untracked files ($((${_ucount}))):"
+        echo "$_untracked" | sed 's/^/    /'
+        [[ $_ucount -gt 20 ]] && echo "    ... and $((_ucount - 20)) more"
+      fi
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Filesystem quarantine: scan modified/created files for suspicious patterns
+# ---------------------------------------------------------------------------
+quarantine_scan() {
+  # Skip for read-only workdir
+  [[ "$READONLY_WORKDIR" == true ]] && return 0
+
+  local scan_dir="$WORKDIR"
+  # For snapshot mode, scan the staging directory
+  [[ "$SNAPSHOT" == true && -d "$SNAPSHOT_STAGING" ]] && scan_dir="$SNAPSHOT_STAGING"
+
+  local warnings=()
+
+  # Check for shell scripts with network commands (potential exfiltration)
+  while IFS= read -r -d '' _f; do
+    local _rel="${_f#"$scan_dir"/}"
+    [[ "$_rel" == .git/* || "$_rel" == node_modules/* ]] && continue
+    if grep -lqE '(curl|wget|nc |ncat|socat)\s' "$_f" 2>/dev/null; then
+      warnings+=("  ⚠ Script with network commands: $_rel")
+    fi
+  done < <(find "$scan_dir" -maxdepth 5 -type f \( -name '*.sh' -o -name '*.bash' \) -print0 2>/dev/null)
+
+  # Check for modified dotfiles (potential persistence)
+  while IFS= read -r -d '' _f; do
+    local _rel="${_f#"$scan_dir"/}"
+    warnings+=("  ⚠ Dotfile present: $_rel")
+  done < <(find "$scan_dir" -maxdepth 2 -type f \( -name '.bashrc' -o -name '.bash_profile' -o -name '.profile' -o -name '.zshrc' \) -print0 2>/dev/null)
+
+  # Check for potential encoded secrets (long base64 strings in text files)
+  while IFS= read -r -d '' _f; do
+    local _rel="${_f#"$scan_dir"/}"
+    [[ "$_rel" == .git/* || "$_rel" == node_modules/* || "$_rel" == *.png || "$_rel" == *.jpg || "$_rel" == *.gz || "$_rel" == *.o ]] && continue
+    if grep -qP '[A-Za-z0-9+/]{80,}={0,2}' "$_f" 2>/dev/null; then
+      warnings+=("  ⚠ Possible encoded secret: $_rel")
+    fi
+  done < <(find "$scan_dir" -maxdepth 5 -type f -size -1M -print0 2>/dev/null | head -z -n 100)
+
+  if [[ ${#warnings[@]} -gt 0 ]]; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  QUARANTINE SCAN (${#warnings[@]} findings)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    printf '%s\n' "${warnings[@]}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    notify quarantine_warning ":warning: Quarantine scan found ${#warnings[@]} suspicious items in \`$(basename "$WORKDIR")\`"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Snapshot merge — review staging changes and apply or rollback
 # ---------------------------------------------------------------------------
 snapshot_merge() {
   [[ "$SNAPSHOT" != true ]] && return 0
@@ -1062,6 +1158,8 @@ if [[ ${#RESOURCE_WRAPPER[@]} -gt 0 ]]; then
   SANDBOX_EXIT=$?
   oom_check $SANDBOX_EXIT
   timeout_check $SANDBOX_EXIT
+  diff_on_exit
+  quarantine_scan
   snapshot_merge
   notify sandbox_exit ":stop_sign: Sandbox exited (code: $SANDBOX_EXIT, workdir: \`$(basename "$WORKDIR")\`)"
   exit $SANDBOX_EXIT
@@ -1069,6 +1167,8 @@ else
   "${TIMEOUT_WRAPPER[@]+"${TIMEOUT_WRAPPER[@]}"}" "${BWRAP[@]}" -- bash -c "$SANDBOX_INIT_SCRIPT" -- "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}"
   SANDBOX_EXIT=$?
   timeout_check $SANDBOX_EXIT
+  diff_on_exit
+  quarantine_scan
   snapshot_merge
   notify sandbox_exit ":stop_sign: Sandbox exited (code: $SANDBOX_EXIT, workdir: \`$(basename "$WORKDIR")\`)"
   exit $SANDBOX_EXIT

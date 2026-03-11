@@ -77,6 +77,8 @@ function parseArgs(argv) {
     enableGithub:      false,
     connectAllowlist:  [],     // additional CONNECT proxy hostnames
     idleTimeout:       0,       // minutes; 0 = disabled
+    tokenLimit:        0,       // max tokens (input+output); 0 = unlimited
+    auditLog:          null,    // path to audit log file
     notifyCommand:     null,
     notifyWebhook:     null,
     mcpBridgeSocket:   null,   // Unix socket for MCP auth proxy
@@ -102,6 +104,8 @@ function parseArgs(argv) {
       // HIGH-3: bearer token read from MCP_BEARER_TOKEN env var (not CLI) to avoid /proc leak.
       // --mcp-bearer-token kept for backwards compat but env var is preferred.
       case '--mcp-bearer-token':   args.mcpBearerToken = argv[++i]; break;
+      case '--token-limit':         args.tokenLimit = parseInt(argv[++i], 10); break;
+      case '--audit-log':           args.auditLog = argv[++i]; break;
       case '--connect-allowlist':   args.connectAllowlist.push(argv[++i]); break;
       case '--enable-github':       args.enableGithub = true; break;
       case '--bridge-only':         args.bridgeOnly = true; break;
@@ -210,6 +214,50 @@ function touchActivity() { _lastRequestTime = Date.now(); }
 function getLastRequestTime() { return _lastRequestTime; }
 
 // ---------------------------------------------------------------------------
+// Token usage tracking — accumulates input/output tokens from API responses
+// ---------------------------------------------------------------------------
+let _totalInputTokens = 0;
+let _totalOutputTokens = 0;
+let _totalRequests = 0;
+let _tokenLimitExceeded = false;
+
+function addTokenUsage(input, output) {
+  _totalInputTokens += input || 0;
+  _totalOutputTokens += output || 0;
+  _totalRequests++;
+}
+
+function getTotalTokens() { return _totalInputTokens + _totalOutputTokens; }
+
+// Module-level refs set at startup for use in forward()
+let _forward_tokenLimit = 0;
+let _forward_notifyCommand = null;
+let _forward_notifyWebhook = null;
+
+function getTokenSummary() {
+  return { input: _totalInputTokens, output: _totalOutputTokens, total: getTotalTokens(), requests: _totalRequests };
+}
+
+// ---------------------------------------------------------------------------
+// Audit log — append structured entries to a JSONL file
+// ---------------------------------------------------------------------------
+let _auditLogPath = null;
+
+function initAuditLog(logPath) {
+  _auditLogPath = logPath;
+  const entry = { ts: new Date().toISOString(), event: 'proxy_start', pid: process.pid };
+  fs.appendFileSync(_auditLogPath, JSON.stringify(entry) + '\n');
+}
+
+function auditLog(entry) {
+  if (!_auditLogPath) return;
+  try {
+    const record = { ts: new Date().toISOString(), ...entry };
+    fs.appendFileSync(_auditLogPath, JSON.stringify(record) + '\n');
+  } catch (e) { /* best effort */ }
+}
+
+// ---------------------------------------------------------------------------
 // Notification helper — sends events via command and/or webhook
 // ---------------------------------------------------------------------------
 function sendNotification(event, message, notifyCommand, notifyWebhook) {
@@ -295,6 +343,7 @@ function forward(method, urlPath, headers, body, res, verbose, onRetry) {
   const opts = { hostname: 'api.anthropic.com', port: 443, path: urlPath, method, headers };
   if (verbose) console.log(`[anthropic] → ${method} https://api.anthropic.com${urlPath}`);
 
+  const reqStartTime = Date.now();
   const req = https.request(opts, (upstream) => {
     if (verbose) console.log(`[anthropic] ← ${upstream.statusCode}`);
     if (upstream.statusCode === 401 && onRetry) {
@@ -302,12 +351,75 @@ function forward(method, urlPath, headers, body, res, verbose, onRetry) {
       onRetry();
       return;
     }
-    res.writeHead(upstream.statusCode, filterResponseHeaders(upstream.headers));
-    upstream.pipe(res);
+    const respHeaders = filterResponseHeaders(upstream.headers);
+    const isStreaming = (upstream.headers['content-type'] || '').includes('text/event-stream');
+
+    // Token tracking: intercept response to extract usage data.
+    // For non-streaming: buffer full body, parse JSON, extract usage.
+    // For streaming: watch for message_delta events with usage in SSE stream.
+    const respChunks = [];
+    upstream.on('data', (chunk) => {
+      respChunks.push(chunk);
+    });
+    upstream.on('end', () => {
+      const respBody = Buffer.concat(respChunks);
+      const durationMs = Date.now() - reqStartTime;
+
+      // Extract usage from response
+      let usage = null;
+      try {
+        if (isStreaming) {
+          // SSE: find last "data: {...}" line containing "usage"
+          const text = respBody.toString('utf8');
+          const lines = text.split('\n').filter(l => l.startsWith('data: ') && l.includes('"usage"'));
+          if (lines.length > 0) {
+            const lastData = JSON.parse(lines[lines.length - 1].slice(6));
+            usage = lastData.usage || (lastData.message && lastData.message.usage) || null;
+          }
+        } else if (upstream.statusCode === 200) {
+          const json = JSON.parse(respBody.toString('utf8'));
+          usage = json.usage || null;
+        }
+      } catch (e) { /* parse failure — skip usage tracking */ }
+
+      if (usage) {
+        addTokenUsage(usage.input_tokens, usage.output_tokens);
+        if (verbose) {
+          const s = getTokenSummary();
+          console.log(`[tokens] +${usage.input_tokens || 0}in +${usage.output_tokens || 0}out (total: ${s.total})`);
+        }
+        // Check token budget after accumulating
+        if (_forward_tokenLimit > 0 && getTotalTokens() >= _forward_tokenLimit && !_tokenLimitExceeded) {
+          _tokenLimitExceeded = true;
+          const s = getTokenSummary();
+          const msg = `:money_with_wings: Token budget exceeded: ${s.total} tokens used (limit: ${_forward_tokenLimit}). New requests will be rejected.`;
+          console.warn(`[tokens] ⚠ Token budget exceeded: ${s.total} (limit: ${_forward_tokenLimit})`);
+          sendNotification('token_limit', msg, _forward_notifyCommand, _forward_notifyWebhook);
+          auditLog({ event: 'token_limit_exceeded', ...s, limit: _forward_tokenLimit });
+        }
+      }
+
+      // Audit log entry
+      auditLog({
+        event: 'api_request',
+        method, path: urlPath, status: upstream.statusCode,
+        duration_ms: durationMs,
+        input_tokens: usage ? usage.input_tokens : null,
+        output_tokens: usage ? usage.output_tokens : null,
+        cumulative_tokens: getTotalTokens(),
+      });
+
+      // Send response to client
+      if (!res.headersSent) {
+        res.writeHead(upstream.statusCode, respHeaders);
+      }
+      res.end(respBody);
+    });
   });
 
   req.on('error', (err) => {
     console.error('[anthropic] upstream error:', err.message);
+    auditLog({ event: 'api_error', method, path: urlPath, error: err.message });
     // MED-3: generic error to sandbox; details logged server-side only.
     if (!res.headersSent) { res.writeHead(502); res.end('Bad Gateway'); }
   });
@@ -316,7 +428,7 @@ function forward(method, urlPath, headers, body, res, verbose, onRetry) {
   req.end();
 }
 
-function createHandler(verbose) {
+function createHandler(verbose, tokenLimit, notifyCommand, notifyWebhook) {
   return function (req, res) {
     // MED-4: normalize URL path to prevent traversal (e.g. /v1/messages/../../admin).
     const parsed = new URL(req.url, 'http://localhost');
@@ -331,6 +443,14 @@ function createHandler(verbose) {
       res.writeHead(403, { 'content-type': 'application/json' });
       // MED-3: don't leak internal path details to sandbox.
       res.end(JSON.stringify({ error: 'Path not allowed' }));
+      return;
+    }
+
+    // Token budget: reject new requests if limit exceeded
+    if (tokenLimit > 0 && _tokenLimitExceeded) {
+      res.writeHead(429, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Token budget exceeded', total_tokens: getTotalTokens(), limit: tokenLimit }));
+      auditLog({ event: 'token_limit_rejected', path: normalizedPath, total: getTotalTokens(), limit: tokenLimit });
       return;
     }
 
@@ -600,7 +720,15 @@ if (args.bridgeOnly) {
 
   if (fs.existsSync(socketPath)) fs.unlinkSync(socketPath);
 
-  const server = http.createServer(createHandler(args.verbose));
+  // Set module-level refs for forward() token tracking
+  _forward_tokenLimit = args.tokenLimit;
+  _forward_notifyCommand = args.notifyCommand;
+  _forward_notifyWebhook = args.notifyWebhook;
+
+  // Initialize audit log if configured
+  if (args.auditLog) initAuditLog(args.auditLog);
+
+  const server = http.createServer(createHandler(args.verbose, args.tokenLimit, args.notifyCommand, args.notifyWebhook));
   server.maxConnections = MAX_CONNECTIONS;
   // LOW-4: request/headers timeout to prevent slowloris from sandbox.
   server.requestTimeout = 120_000;
@@ -639,6 +767,12 @@ if (args.bridgeOnly) {
   }
 
   const cleanup = () => {
+    // Log final token summary
+    const s = getTokenSummary();
+    if (s.requests > 0) {
+      console.log(`[tokens] Session total: ${s.total} tokens (${s.input} in + ${s.output} out) across ${s.requests} requests`);
+    }
+    auditLog({ event: 'proxy_stop', ...s });
     try { fs.unlinkSync(socketPath); } catch (_) {}
     if (githubSocketPath) { try { fs.unlinkSync(githubSocketPath); } catch (_) {} }
     if (mcpBridgeSocketPath) { try { fs.unlinkSync(mcpBridgeSocketPath); } catch (_) {} }
@@ -667,6 +801,13 @@ if (args.bridgeOnly) {
       }
     }, 60_000); // check every minute
     console.log(`[idle] Idle timeout: ${args.idleTimeout} minutes`);
+  }
+
+  if (args.tokenLimit > 0) {
+    console.log(`[tokens] Token budget: ${args.tokenLimit.toLocaleString()} tokens`);
+  }
+  if (args.auditLog) {
+    console.log(`[audit] Logging to: ${args.auditLog}`);
   }
 
   console.log('[anthropic] Credential sources: CLAUDE_CREDENTIALS_FILE → macOS Keychain → ~/.claude/.credentials.json');
