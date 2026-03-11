@@ -86,6 +86,49 @@ SNAPSHOT=false         # overlayfs snapshot mode
 OVERLAY_DIR=""         # host-side overlay directory (auto-created)
 TOKEN_LIMIT=""         # max tokens (input+output); empty = unlimited
 AUDIT_LOG=""           # path to audit log file
+OUTPUT_DIR=""          # separate writable output directory
+CACHE_HOME=""          # cache directory for sandbox home state
+SECCOMP=false          # enable seccomp syscall filter
+IMAGE=""               # container image root filesystem (extracted rootfs directory)
+
+# ---------------------------------------------------------------------------
+# Profile pre-scan: extract --profile from args, load profile options, and
+# prepend them before CLI args so the single main parser handles everything
+# with full validation. CLI args override profile options.
+# ---------------------------------------------------------------------------
+_profile_name=""
+for _i in $(seq 1 $#); do
+  _arg="${!_i}"
+  if [[ "$_arg" == "--profile" ]]; then
+    _next=$((_i + 1))
+    _profile_name="${!_next:-}"
+    break
+  fi
+done
+if [[ -n "$_profile_name" ]]; then
+  # Validate profile name (no path traversal)
+  [[ "$_profile_name" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "❌ --profile: invalid name '$_profile_name' (alphanumeric, dash, underscore only)"; exit 1; }
+  _profile_dir="${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/profiles"
+  _profile_file="$_profile_dir/${_profile_name}.conf"
+  [[ -f "$_profile_file" ]] || { echo "❌ --profile: not found: $_profile_file"; exit 1; }
+  # SEC: reject symlinks to prevent reading arbitrary files as profiles
+  [[ -L "$_profile_file" ]] && { echo "❌ --profile: symlinks not allowed: $_profile_file"; exit 1; }
+  echo "✔ Loading profile: $_profile_name ($_profile_file)"
+  _profile_args=()
+  while IFS= read -r _line; do
+    _line="${_line%%#*}"  # strip comments
+    _line="${_line#"${_line%%[![:space:]]*}"}"  # trim leading
+    _line="${_line%"${_line##*[![:space:]]}"}"  # trim trailing
+    [[ -z "$_line" ]] && continue
+    # Split line into words safely (no eval)
+    read -ra _words <<< "$_line"
+    _profile_args+=("${_words[@]}")
+  done < "$_profile_file"
+  # Prepend profile args before CLI args (CLI wins on conflicts since it's parsed last)
+  if [[ ${#_profile_args[@]} -gt 0 ]]; then
+    set -- "${_profile_args[@]}" "$@"
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -101,7 +144,10 @@ while [[ $# -gt 0 ]]; do
     --dummy-credentials) DUMMY_CREDS_FILE=$2; shift 2 ;;
     --workdir)           WORKDIR=$2; shift 2 ;;
     --sandbox-home)      SANDBOX_HOME_SEED=$2; shift 2 ;;
-    --enable-github)     ENABLE_GITHUB=true;  shift ;;
+    --enable-github)
+      echo "⚠ --enable-github is DEPRECATED: real GH_TOKEN enters the sandbox."
+      echo "  Use --enable-github-mcp instead (token stays on host)."
+      ENABLE_GITHUB=true; shift ;;
     --disable-github)    ENABLE_GITHUB=false; shift ;;
     --gh-token-file)     GH_TOKEN_FILE=$2; shift 2 ;;
     --enable-github-mcp) ENABLE_GITHUB_MCP=true; shift ;;
@@ -122,6 +168,11 @@ while [[ $# -gt 0 ]]; do
     --notify-webhook)
       # MED-1: only allow https webhooks to prevent SSRF to internal services.
       [[ "$2" =~ ^https:// ]] || { echo "❌ --notify-webhook: only https:// URLs allowed"; exit 1; }
+      # SEC: reject private/internal addresses to prevent SSRF
+      _wh_host=$(echo "$2" | sed -n 's|^https://\([^/:]*\).*|\1|p')
+      if [[ "$_wh_host" =~ ^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|0\.|localhost$|\[::1\]|\[fc|\[fd) ]]; then
+        echo "❌ --notify-webhook: private/internal addresses not allowed"; exit 1
+      fi
       NOTIFY_WEBHOOK=$2; shift 2 ;;
     --allowlist-url)
       # Validate: must be a hostname (no scheme, no path, no port)
@@ -138,6 +189,19 @@ while [[ $# -gt 0 ]]; do
       TOKEN_LIMIT=$2; shift 2 ;;
     --audit-log)
       AUDIT_LOG=$2; shift 2 ;;
+    --output-dir)
+      OUTPUT_DIR=$(realpath "$2" 2>/dev/null || echo "$2")
+      [[ -d "$OUTPUT_DIR" ]] || { echo "❌ --output-dir does not exist: $OUTPUT_DIR"; exit 1; }
+      shift 2 ;;
+    --cache-home)
+      CACHE_HOME=$(realpath "$2" 2>/dev/null || echo "$2")
+      shift 2 ;;
+    --seccomp)  SECCOMP=true; shift ;;
+    --profile)  shift 2 ;;  # already processed in pre-scan above
+    --image)
+      IMAGE=$(realpath "$2" 2>/dev/null || echo "$2")
+      [[ -d "$IMAGE" ]] || { echo "❌ --image: directory not found: $IMAGE (must be an extracted rootfs)"; exit 1; }
+      shift 2 ;;
     --anthropic-port)
       [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1024 && $2 <= 65535 )) || { echo "❌ --anthropic-port: invalid port '$2' (1024-65535)"; exit 1; }
       PORT_ANTHROPIC=$2; shift 2 ;;
@@ -184,6 +248,16 @@ OPTIONS:
   --timeout MINS         Wall-clock timeout: kill sandbox after MINS minutes.
   --token-limit N        Max tokens (input+output). Proxy rejects requests after limit.
   --audit-log FILE       Log API requests (method, path, tokens, timing) to JSONL file.
+  --output-dir DIR       Mount DIR as writable /output inside sandbox. Use with --read-only-workdir
+                         to allow writes only to the output directory.
+  --cache-home DIR       Cache sandbox home directory. Saves home state on first run,
+                         restores on subsequent runs for faster startup.
+  --seccomp              Enable seccomp syscall filter. Blocks dangerous syscalls:
+                         ptrace, mount, reboot, kexec_load, init_module, etc.
+  --profile NAME         Load a named profile from ~/.config/claudebox/profiles/NAME.conf.
+                         Profile files contain claudebox options (one per line, # comments).
+  --image DIR            Use DIR as the root filesystem (extracted container image / rootfs).
+                         Replaces host /usr bind with image's /usr, /lib, /bin, etc.
   --dry-run              Print the bwrap command without executing it.
   --mem-limit SIZE       Memory limit (e.g. 4G, 512M). Uses cgroups via systemd-run.
   --cpu-limit PERCENT    CPU limit as percentage (100 = 1 core, 200 = 2 cores).
@@ -324,6 +398,10 @@ cleanup() {
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
   [[ -n "$MCP_SERVER_PID" ]] && kill "$MCP_SERVER_PID" 2>/dev/null || true
   rm -f "$SOCKET_ANTHROPIC" "$SOCKET_GITHUB" "$SOCKET_MCP" 2>/dev/null || true
+  if [[ -n "${SECCOMP_BPF:-}" ]]; then
+    [[ -f "$SECCOMP_BPF" ]] && rm -f "$SECCOMP_BPF" 2>/dev/null || true
+    exec 9<&- 2>/dev/null || true
+  fi
   rm -rf "$ATTACH_DIR" 2>/dev/null || true
   [[ -n "$TEMP_CREDS" && -f "$TEMP_CREDS" && -z "$DUMMY_CREDS_FILE" ]] && rm -f "$TEMP_CREDS" || true
   # HIGH-4: clean up private temp dir if we created it
@@ -547,7 +625,63 @@ system_dir_args() {
 mkdir -p "$ATTACH_DIR"
 chmod 700 "$ATTACH_DIR"
 
-mapfile -d '' SYS_ARGS < <(system_dir_args)
+# Common host /etc paths needed for networking, SSL, and time
+_HOST_ETC_OVERRIDES=(
+  /etc/resolv.conf /etc/nsswitch.conf /etc/hosts /etc/hostname
+  /etc/localtime /etc/timezone
+  /etc/ssl/certs /etc/ca-certificates /etc/pki
+)
+
+# ---------------------------------------------------------------------------
+# Container image support: use extracted rootfs instead of host system dirs
+# ---------------------------------------------------------------------------
+if [[ -n "$IMAGE" ]]; then
+  # Validate image has basic structure
+  [[ -d "$IMAGE/usr" ]] || { echo "❌ --image: $IMAGE/usr not found (not a valid rootfs)"; exit 1; }
+  echo "✔ Using container image rootfs: $IMAGE"
+
+  IMAGE_SYS_ARGS=()
+  # Bind image's /usr
+  IMAGE_SYS_ARGS+=(--ro-bind "$IMAGE/usr" /usr)
+  # Bind image's /bin, /lib, /lib64, /sbin — handle symlinks
+  for d in bin sbin lib lib64; do
+    local_path="$IMAGE/$d"
+    if [[ -L "$local_path" ]]; then
+      target=$(readlink "$local_path")
+      IMAGE_SYS_ARGS+=(--symlink "$target" "/$d")
+    elif [[ -d "$local_path" ]]; then
+      IMAGE_SYS_ARGS+=(--ro-bind "$local_path" "/$d")
+    fi
+  done
+
+  # Use image's /etc if available, with host overrides for networking
+  IMAGE_SYS_ARGS+=(--ro-bind-try "$IMAGE/etc" /etc)
+  # Override host network/SSL/time config on top of image /etc
+  for _p in "${_HOST_ETC_OVERRIDES[@]}"; do
+    IMAGE_SYS_ARGS+=(--ro-bind-try "$_p" "$_p")
+  done
+
+  # Bind image's /opt if present (some images put tools there)
+  [[ -d "$IMAGE/opt" ]] && IMAGE_SYS_ARGS+=(--ro-bind "$IMAGE/opt" /opt)
+
+  SYS_ARGS=("${IMAGE_SYS_ARGS[@]}")
+  ETC_ARGS=()  # /etc already handled above
+else
+  mapfile -d '' SYS_ARGS < <(system_dir_args)
+  ETC_ARGS=(
+    # MED-4: mount only the /etc files actually needed; avoids exposing SSH keys,
+    # sudoers, shadow, and other sensitive host config.
+    --dir /etc
+    --ro-bind-try /etc/ld.so.cache      /etc/ld.so.cache
+    --ro-bind-try /etc/ld.so.conf       /etc/ld.so.conf
+    --ro-bind-try /etc/ld.so.conf.d     /etc/ld.so.conf.d
+    --ro-bind-try /etc/passwd           /etc/passwd
+    --ro-bind-try /etc/group            /etc/group
+  )
+  for _p in "${_HOST_ETC_OVERRIDES[@]}"; do
+    ETC_ARGS+=(--ro-bind-try "$_p" "$_p")
+  done
+fi
 
 BWRAP=(
   bwrap
@@ -566,23 +700,8 @@ BWRAP=(
   # ---- Core filesystem ----
   "${SYS_ARGS[@]}"
 
-  # MED-4: mount only the /etc files actually needed; avoids exposing SSH keys,
-  # sudoers, shadow, and other sensitive host config.
-  --dir /etc
-  --ro-bind-try /etc/ld.so.cache      /etc/ld.so.cache
-  --ro-bind-try /etc/ld.so.conf       /etc/ld.so.conf
-  --ro-bind-try /etc/ld.so.conf.d     /etc/ld.so.conf.d
-  --ro-bind-try /etc/ssl/certs        /etc/ssl/certs
-  --ro-bind-try /etc/ca-certificates  /etc/ca-certificates
-  --ro-bind-try /etc/pki              /etc/pki
-  --ro-bind-try /etc/resolv.conf      /etc/resolv.conf
-  --ro-bind-try /etc/nsswitch.conf    /etc/nsswitch.conf
-  --ro-bind-try /etc/hosts            /etc/hosts
-  --ro-bind-try /etc/hostname         /etc/hostname
-  --ro-bind-try /etc/localtime        /etc/localtime
-  --ro-bind-try /etc/timezone         /etc/timezone
-  --ro-bind-try /etc/passwd           /etc/passwd
-  --ro-bind-try /etc/group            /etc/group
+  # ---- /etc ----
+  "${ETC_ARGS[@]+"${ETC_ARGS[@]}"}"
 
   # MED-5: replace /sys with an empty tmpfs; removes hardware fingerprinting
   # and kernel interface exposure. Re-add specific paths if a tool requires them.
@@ -594,9 +713,7 @@ BWRAP=(
   --tmpfs /tmp
   --tmpfs /run
 
-  # ---- Fake home (tmpfs; real home not exposed) ----
-  --tmpfs /home
-  --dir "$SANDBOX_HOME"
+  # ---- Home directory (cache-home uses persistent bind; default uses tmpfs) ----
 
   # ---- Workdir (added conditionally after array) ----
 
@@ -638,6 +755,20 @@ BWRAP=(
   --chdir /workspace
 )
 
+# Home directory: cache-home uses persistent bind mount; default uses tmpfs
+if [[ -n "$CACHE_HOME" ]]; then
+  if [[ ! -d "$CACHE_HOME" ]]; then
+    mkdir -p "$CACHE_HOME"
+    chmod 700 "$CACHE_HOME"
+    echo "✔ Cache home created: $CACHE_HOME"
+  else
+    echo "✔ Cache home restored: $CACHE_HOME"
+  fi
+  BWRAP+=(--dir /home --bind "$CACHE_HOME" "$SANDBOX_HOME")
+else
+  BWRAP+=(--tmpfs /home --dir "$SANDBOX_HOME")
+fi
+
 # Workdir bind mount: snapshot (staging copy), ro, or rw
 if [[ "$SNAPSHOT" == true ]]; then
   # Snapshot: bind the staging copy (rw), original workdir untouched
@@ -673,6 +804,11 @@ if [[ "$ENABLE_GITHUB_MCP" == true ]]; then
     --setenv _MCP_PORT "$PORT_MCP"
     --setenv _ENABLE_GITHUB_MCP "true"
   )
+fi
+
+# Output directory: separate writable mount at /output
+if [[ -n "$OUTPUT_DIR" ]]; then
+  BWRAP+=(--bind "$OUTPUT_DIR" /output)
 fi
 
 # ~/.claude sharing
@@ -749,6 +885,132 @@ if [[ -n "$SANDBOX_HOME_SEED" ]]; then
     echo "❌ --sandbox-home: directory not found: $SANDBOX_HOME_SEED"; exit 1; }
   [[ -d "$SANDBOX_HOME_SEED" ]] || { echo "❌ --sandbox-home: not a directory: $SANDBOX_HOME_SEED"; exit 1; }
   BWRAP+=(--ro-bind "$SANDBOX_HOME_SEED" /run/sandbox-home-seed)
+fi
+
+# ---------------------------------------------------------------------------
+# Seccomp filter: block dangerous syscalls
+# Uses bwrap's --seccomp FD to load a BPF filter
+# ---------------------------------------------------------------------------
+SECCOMP_BPF=""
+if [[ "$SECCOMP" == true ]]; then
+  # Generate a seccomp BPF filter using a small Python script.
+  # Blocks: ptrace, mount, umount2, reboot, kexec_load, init_module,
+  #   finit_module, delete_module, pivot_root, swapon, swapoff,
+  #   acct, settimeofday, clock_settime, adjtimex
+  SECCOMP_BPF=$(mktemp "${_SOCK_DIR}/claudebox-seccomp-XXXXXX.bpf")
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$SECCOMP_BPF" <<'PYEOF'
+import struct, sys, os
+
+# BPF instruction format: unsigned short code, unsigned char jt, jf; unsigned int k
+def bpf_stmt(code, k):
+    return struct.pack("HBBI", code, 0, 0, k)
+def bpf_jump(code, k, jt, jf):
+    return struct.pack("HBBI", code, jt, jf, k)
+
+# BPF constants
+BPF_LD = 0x00; BPF_W = 0x00; BPF_ABS = 0x20
+BPF_JMP = 0x05; BPF_JEQ = 0x10; BPF_K = 0x00
+BPF_RET = 0x06
+SECCOMP_RET_ALLOW = 0x7fff0000
+SECCOMP_RET_ERRNO = 0x00050000
+EPERM = 1
+
+# Detect architecture for syscall numbers
+machine = os.uname().machine
+if machine == "x86_64":
+    AUDIT_ARCH = 0xc000003e  # AUDIT_ARCH_X86_64
+    NR_OFFSET = 0  # offsetof(struct seccomp_data, nr)
+    ARCH_OFFSET = 4  # offsetof(struct seccomp_data, arch)
+    blocked = {
+        101: "ptrace",
+        165: "mount",
+        166: "umount2",
+        169: "reboot",
+        175: "init_module",
+        176: "delete_module",
+        246: "kexec_load",
+        155: "pivot_root",
+        167: "swapon",
+        168: "swapoff",
+        163: "acct",
+        164: "settimeofday",
+        227: "clock_settime",
+        159: "adjtimex",
+        313: "finit_module",
+        321: "bpf",            # SEC: prevent eBPF loading
+        310: "process_vm_readv",  # SEC: prevent cross-process memory read
+        311: "process_vm_writev", # SEC: prevent cross-process memory write
+    }
+elif machine == "aarch64":
+    AUDIT_ARCH = 0xc00000b7  # AUDIT_ARCH_AARCH64
+    NR_OFFSET = 0
+    ARCH_OFFSET = 4
+    blocked = {
+        117: "ptrace",
+        40: "mount",
+        39: "umount2",
+        142: "reboot",
+        105: "init_module",
+        106: "delete_module",
+        104: "finit_module",
+        # kexec_load not available on aarch64 (use kexec_file_load=294)
+        294: "kexec_file_load",
+        41: "pivot_root",
+        224: "swapon",
+        225: "swapoff",
+        89: "acct",
+        170: "settimeofday",
+        112: "clock_settime",
+        171: "adjtimex",
+        280: "bpf",            # SEC: prevent eBPF loading
+        270: "process_vm_readv",  # SEC: prevent cross-process memory read
+        271: "process_vm_writev", # SEC: prevent cross-process memory write
+    }
+else:
+    # Unsupported arch — write empty file, seccomp will be skipped
+    open(sys.argv[1], "wb").close()
+    sys.exit(0)
+
+prog = bytearray()
+# Load arch
+prog += bpf_stmt(BPF_LD | BPF_W | BPF_ABS, ARCH_OFFSET)
+# SEC: deny non-matching arch to block x86-32 compat syscalls (int 0x80 bypass)
+total_blocked = len(blocked)
+prog += bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH, 1, 0)
+prog += bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM)
+# Load syscall number
+prog += bpf_stmt(BPF_LD | BPF_W | BPF_ABS, NR_OFFSET)
+# For each blocked syscall: if match, jump to ERRNO return
+sorted_nrs = sorted(blocked.keys())
+for i, nr in enumerate(sorted_nrs):
+    remaining = total_blocked - i - 1
+    # If match: jump to the ERRNO instruction (remaining checks + 1 allow)
+    prog += bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr, remaining + 1, 0)
+# Default: allow
+prog += bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
+# Blocked: return EPERM
+prog += bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM)
+
+with open(sys.argv[1], "wb") as f:
+    f.write(prog)
+PYEOF
+  else
+    echo "⚠ --seccomp requires python3 to generate BPF filter — skipping"
+    SECCOMP=false
+    rm -f "$SECCOMP_BPF"
+    SECCOMP_BPF=""
+  fi
+
+  if [[ -n "$SECCOMP_BPF" && -s "$SECCOMP_BPF" ]]; then
+    # bwrap --seccomp takes an FD number. We open the file on FD 9.
+    exec 9< "$SECCOMP_BPF"
+    BWRAP+=(--seccomp 9)
+    echo "✔ Seccomp filter enabled ($(wc -c < "$SECCOMP_BPF") bytes BPF)"
+  elif [[ -n "$SECCOMP_BPF" ]]; then
+    echo "⚠ Seccomp: unsupported architecture ($(uname -m)) — skipping"
+    SECCOMP=false
+  fi
 fi
 
 # Network namespace isolation

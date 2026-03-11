@@ -58,6 +58,9 @@ const GITHUB_ALLOWLIST = ['api.github.com'];
 // MED-5: maximum request body size (bytes) to prevent host OOM via proxy.
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB
 
+// SEC: maximum response body size to prevent host OOM from buffered responses.
+const MAX_RESPONSE_SIZE = 100 * 1024 * 1024; // 100 MB
+
 // Maximum concurrent connections per server (MED-4: prevent FD exhaustion).
 const MAX_CONNECTIONS = 100;
 
@@ -246,7 +249,10 @@ let _auditLogPath = null;
 function initAuditLog(logPath) {
   _auditLogPath = logPath;
   const entry = { ts: new Date().toISOString(), event: 'proxy_start', pid: process.pid };
-  fs.appendFileSync(_auditLogPath, JSON.stringify(entry) + '\n');
+  // SEC: create audit log with restrictive permissions (owner-only read/write)
+  const fd = fs.openSync(_auditLogPath, 'a', 0o600);
+  fs.writeSync(fd, JSON.stringify(entry) + '\n');
+  fs.closeSync(fd);
 }
 
 function auditLog(entry) {
@@ -278,6 +284,14 @@ function sendNotification(event, message, notifyCommand, notifyWebhook) {
     // MED-1: only allow https webhooks to prevent SSRF to internal services.
     if (u.protocol !== 'https:') {
       console.warn(`[notify] webhook rejected: only https allowed (got ${u.protocol})`);
+      return;
+    }
+    // SEC: reject private/internal IPs to prevent SSRF
+    const host = u.hostname;
+    if (/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|0\.)/.test(host) ||
+        host === 'localhost' || host === '::1' || host.startsWith('fc') || host.startsWith('fd') ||
+        host.startsWith('[::1]') || host.startsWith('[fc') || host.startsWith('[fd')) {
+      console.warn(`[notify] webhook rejected: private/internal address (${host})`);
       return;
     }
     const reqOpts = {
@@ -315,25 +329,32 @@ function filterResponseHeaders(headers) {
 
 function injectToken(headers, verbose) {
   const token = getAccessToken();
-  if (!token) return { ok: false, error: 'No Claude credentials found on host' };
+  if (!token) return { ok: false, error: 'Credential error' };
 
   const updated = {};
   let replaced = false;
   for (const [k, v] of Object.entries(headers)) {
-    if ((k.toLowerCase() === 'authorization' || k.toLowerCase() === 'x-api-key') &&
-        typeof v === 'string' && v.includes(DUMMY_CLAUDE_TOKEN)) {
+    const kl = k.toLowerCase();
+    if ((kl === 'authorization' || kl === 'x-api-key') && typeof v === 'string') {
+      // SEC: reject if header contains anything besides the dummy token (no piggyback)
+      // Strip "Bearer " prefix for comparison if present.
+      const bare = /^Bearer /i.test(v) ? v.slice(7) : v;
+      if (bare !== DUMMY_CLAUDE_TOKEN) {
+        return { ok: false, error: 'Auth header rejected' };
+      }
       updated[k] = v.replace(DUMMY_CLAUDE_TOKEN, token);
       replaced = true;
+    } else if (kl === 'authorization' || kl === 'x-api-key') {
+      // Reject non-string auth headers (array injection)
+      return { ok: false, error: 'Auth header rejected' };
     } else {
       updated[k] = v;
     }
   }
 
   // HIGH-2: require a dummy token to be present; reject requests with no auth.
-  // This prevents sandbox code from making arbitrary Anthropic calls without
-  // the dummy credential structure that Claude Code always sends.
   if (!replaced) {
-    return { ok: false, error: 'Request carries no dummy Claude token; injection refused' };
+    return { ok: false, error: 'Auth header rejected' };
   }
 
   return { ok: true, headers: updated };
@@ -358,10 +379,22 @@ function forward(method, urlPath, headers, body, res, verbose, onRetry) {
     // For non-streaming: buffer full body, parse JSON, extract usage.
     // For streaming: watch for message_delta events with usage in SSE stream.
     const respChunks = [];
+    let respLen = 0;
+    let respAborted = false;
     upstream.on('data', (chunk) => {
+      if (respAborted) return;
+      respLen += chunk.length;
+      // SEC: prevent host OOM from very large API responses
+      if (respLen > MAX_RESPONSE_SIZE) {
+        respAborted = true;
+        upstream.destroy();
+        if (!res.headersSent) { res.writeHead(502); res.end('Response too large'); }
+        return;
+      }
       respChunks.push(chunk);
     });
     upstream.on('end', () => {
+      if (respAborted) return;
       const respBody = Buffer.concat(respChunks);
       const durationMs = Date.now() - reqStartTime;
 
@@ -487,7 +520,8 @@ function createHandler(verbose, tokenLimit, notifyCommand, notifyWebhook) {
         if (!result.ok) {
           console.error('[anthropic] credential error:', result.error);
           res.writeHead(401, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: result.error }));
+          // SEC: generic error to sandbox; details logged server-side only.
+          res.end(JSON.stringify({ error: 'Authentication failed' }));
           return;
         }
         const h = result.headers;
@@ -574,7 +608,13 @@ function startMcpAuthProxy(targetPort, socketPath, bearerToken) {
       if (body.length) opts.headers['content-length'] = String(body.length);
 
       const upstream = http.request(opts, (upRes) => {
-        res.writeHead(upRes.statusCode, upRes.headers);
+        // SEC: filter response headers — drop sensitive headers from MCP server
+        const safeHeaders = {};
+        const dropHeaders = new Set(['set-cookie', 'location', 'x-forwarded-for', 'x-forwarded-host']);
+        for (const [k, v] of Object.entries(upRes.headers)) {
+          if (!dropHeaders.has(k.toLowerCase())) safeHeaders[k] = v;
+        }
+        res.writeHead(upRes.statusCode, safeHeaders);
         upRes.pipe(res);
       });
       upstream.on('error', (err) => {
@@ -629,6 +669,12 @@ function makeConnectHandler(allowlist, verbose) {
         return;
       }
 
+      // SEC: reject targets with control characters (CRLF injection / request smuggling)
+      if (!target || /[\x00-\x1f\x7f]/.test(target) || !/^[a-zA-Z0-9._-]+:\d+$/.test(target)) {
+        client.end('HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n');
+        return;
+      }
+
       const colonIdx   = target.lastIndexOf(':');
       const host       = colonIdx >= 0 ? target.slice(0, colonIdx) : target;
       const targetPort = colonIdx >= 0 ? parseInt(target.slice(colonIdx + 1), 10) : 443;
@@ -646,7 +692,21 @@ function makeConnectHandler(allowlist, verbose) {
 
       if (verbose) console.log(`[github-connect] → CONNECT ${target}`);
 
-      const upstream = net.createConnection(targetPort, host, () => {
+      // SEC: DNS rebinding protection — resolve hostname and reject private IPs
+      const dns = require('dns');
+      dns.lookup(host, (err, address) => {
+        if (err) {
+          client.end('HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n');
+          return;
+        }
+        // Reject private/loopback/link-local IPs
+        if (/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|0\.|::1|fc|fd)/.test(address)) {
+          console.warn(`[github-connect] DNS rebinding blocked: ${host} resolved to ${address}`);
+          client.end('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n');
+          return;
+        }
+
+      const upstream = net.createConnection(targetPort, address, () => {
         client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
         if (afterHeader.length) upstream.write(afterHeader);
         client.pipe(upstream);
@@ -661,6 +721,8 @@ function makeConnectHandler(allowlist, verbose) {
       client.on('error', cleanup);
       client.on('close', cleanup);
       upstream.on('close', cleanup);
+      });
+
     }
 
     client.on('data', onData);
@@ -762,6 +824,12 @@ if (args.bridgeOnly) {
   // MCP auth proxy (inject Bearer token, forward to MCP server on host)
   let mcpBridgeSocketPath = null;
   if (args.mcpBridgeSocket && args.mcpBridgePort && args.mcpBearerToken) {
+    // SEC: validate bearer token format (non-empty, no control characters)
+    if (typeof args.mcpBearerToken !== 'string' || args.mcpBearerToken.length === 0 ||
+        /[\x00-\x1f\x7f]/.test(args.mcpBearerToken)) {
+      console.error('[mcp-proxy] MCP_BEARER_TOKEN is invalid (empty or contains control characters)');
+      process.exit(1);
+    }
     mcpBridgeSocketPath = args.mcpBridgeSocket;
     startMcpAuthProxy(args.mcpBridgePort, mcpBridgeSocketPath, args.mcpBearerToken);
   }

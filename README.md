@@ -66,6 +66,7 @@ sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 | File | Purpose |
 |---|---|
 | `claudebox.sh` | Sandbox launcher (bwrap + systemd-run) |
+| `claudebox-supervisor.sh` | Multi-sandbox orchestrator for parallel tasks |
 | `credential-proxy.js` | Host-side credential injection proxy + CONNECT proxy |
 | `run-example.sh` | Example invocations |
 
@@ -147,6 +148,13 @@ GH_TOKEN=ghp_xxx ./claudebox.sh --enable-github
 --timeout MINS         Wall-clock timeout in minutes. Kills sandbox after MINS minutes.
 --token-limit N        Max tokens (input+output). Proxy rejects new requests after limit.
 --audit-log FILE       Log API requests (method, path, tokens, timing) to JSONL file.
+--output-dir DIR       Mount DIR as writable /output inside sandbox. Useful with
+                       --read-only-workdir for analysis tasks that produce output.
+--cache-home DIR       Persistent sandbox home directory across runs. Preserves
+                       installed tools, configs, and cached data between sessions.
+--seccomp              Enable seccomp filter blocking dangerous syscalls (ptrace, mount, etc.)
+--profile NAME         Load options from ~/.config/claudebox/profiles/NAME.conf.
+--image DIR            Use extracted container rootfs as base filesystem instead of host /usr.
 --dry-run              Print the full bwrap command without executing it.
 --anthropic-port PORT  TCP port for Anthropic proxy bridge (default: 58080).
 --github-port PORT     TCP port for GitHub CONNECT proxy bridge (default: 58081).
@@ -566,6 +574,144 @@ After sandbox exit, files are scanned for suspicious patterns:
 The scan runs automatically. A `quarantine_warning` notification is sent if findings
 are detected. This is informational — files are not blocked or deleted.
 
+## Output Directory
+
+Use `--output-dir` with `--read-only-workdir` for analysis tasks that produce output
+without modifying the original codebase:
+
+```bash
+mkdir -p ~/review-output
+./claudebox.sh \
+  --read-only-workdir \
+  --output-dir ~/review-output \
+  --workdir ~/projects/myapp \
+  -- -p "analyze this codebase and write a report to /output/report.md"
+```
+
+Inside the sandbox, `/output` is writable while `/workspace` is read-only.
+The output directory persists on the host after the sandbox exits.
+
+## Cache Home
+
+Use `--cache-home` to preserve the sandbox home directory across runs. This avoids
+re-installing tools, re-downloading packages, or re-configuring settings each time:
+
+```bash
+# First run: tools are installed, configs written
+./claudebox.sh --cache-home ~/.cache/claudebox/home --workdir ~/projects/myapp
+
+# Second run: instant startup with all tools and configs preserved
+./claudebox.sh --cache-home ~/.cache/claudebox/home --workdir ~/projects/myapp
+```
+
+The cache directory is bind-mounted as the sandbox home (`/home/sandbox`) instead
+of using a fresh tmpfs. Contents persist between sandbox sessions.
+
+## Multiple Sandbox Orchestration
+
+`claudebox-supervisor.sh` launches multiple sandboxes in parallel, each running a
+separate task. Useful for batch code reviews, parallel feature work, or running
+multiple analyses concurrently.
+
+```bash
+# Parallel code reviews (shared read-only workdir)
+./claudebox-supervisor.sh \
+  --workdir ~/projects/myapp \
+  --shared-workdir \
+  --task "review src/auth.ts for security issues" \
+  --task "review src/api.ts for error handling" \
+  --task "review src/db.ts for SQL injection"
+
+# Tasks from a file with token budget
+./claudebox-supervisor.sh \
+  --workdir ~/projects/myapp \
+  --task-file review-tasks.txt \
+  --token-limit 500000 \
+  --timeout 30
+
+# Parallel feature work (each task gets its own workdir copy)
+./claudebox-supervisor.sh \
+  --workdir ~/projects/myapp \
+  --output-dir ~/review-output \
+  --max-parallel 3 \
+  --task "add input validation to the login form" \
+  --task "add rate limiting to the API endpoints"
+```
+
+**Options**:
+- `--task "PROMPT"`: Add a task (repeatable)
+- `--task-file FILE`: Read tasks from file (one per line, `#` comments)
+- `--shared-workdir`: All tasks share the same workdir (read-only)
+- `--max-parallel N`: Limit concurrent sandboxes
+- `--token-limit N`: Per-sandbox token budget
+- `--timeout MINS`: Per-sandbox wall-clock timeout
+- `--output-dir DIR`: Base directory for per-task output
+
+On completion, a summary shows each task's status, token usage, and output location.
+
+## Seccomp Filter
+
+Use `--seccomp` to enable a syscall filter that blocks dangerous operations:
+
+```bash
+./claudebox.sh --seccomp --workdir ~/projects/myapp
+```
+
+Blocked syscalls: `ptrace`, `mount`, `umount2`, `reboot`, `kexec_load`, `init_module`,
+`finit_module`, `delete_module`, `pivot_root`, `swapon`, `swapoff`, `acct`,
+`settimeofday`, `clock_settime`, `adjtimex`.
+
+These syscalls return `EPERM` if called. Normal development operations (file I/O,
+networking, process management) are unaffected. Requires `python3` on the host to
+generate the BPF filter. Supports x86_64 and aarch64.
+
+## Sandbox Profiles
+
+Profiles let you save commonly-used option combinations in a config file:
+
+```bash
+# Load a named profile
+./claudebox.sh --profile review --workdir ~/projects/myapp
+
+# Profile with CLI overrides (CLI takes precedence)
+./claudebox.sh --profile development --workdir ~/projects/myapp --timeout 120
+```
+
+Profiles are stored at `~/.config/claudebox/profiles/NAME.conf` — one option per line,
+`#` comments allowed. Example profiles are in `examples/profiles/`.
+
+Example `review.conf`:
+```
+# Read-only code review with security hardening
+--read-only-workdir
+--seccomp
+--idle-timeout 10
+--mem-limit 4G
+```
+
+## Container Image Support
+
+Use `--image DIR` to run the sandbox with an extracted container rootfs instead of the
+host's system directories:
+
+```bash
+# Extract a Docker image
+mkdir -p /tmp/ubuntu-rootfs
+docker export $(docker create ubuntu:24.04) | tar -C /tmp/ubuntu-rootfs -xf -
+
+# Run sandbox with that rootfs
+./claudebox.sh --image /tmp/ubuntu-rootfs --workdir ~/projects/myapp
+```
+
+The image directory must contain at least `/usr`. The sandbox will use the image's
+`/usr`, `/bin`, `/lib`, `/sbin`, and `/etc` (with host network config overlaid).
+The image's `/opt` is also mounted if present.
+
+This is useful for:
+- Running Claude Code with different system libraries or tool versions
+- Testing against specific OS environments
+- Reproducible sandbox environments across machines
+
 ## Sandbox Security Properties
 
 | Property | Detail |
@@ -580,6 +726,7 @@ are detected. This is informational — files are not blocked or deleted.
 | **/etc** | Only ~12 specific files mounted (ld.so, SSL certs, DNS, passwd/group) |
 | **/sys** | Empty tmpfs (no hardware fingerprinting) |
 | **Namespaces** | user, ipc, pid, uts, cgroup, net (all unshared) |
+| **Seccomp** | Optional (`--seccomp`): blocks ptrace, mount, reboot, kexec, and other dangerous syscalls |
 | **Path allowlist** | Proxy only forwards `/v1/(messages\|complete\|models\|count_tokens)` |
 | **URL normalization** | Path traversal (`../`) resolved before allowlist check |
 | **Body size limit** | 10 MB max request body to prevent host OOM via proxy |
