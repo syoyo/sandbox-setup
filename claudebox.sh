@@ -1129,6 +1129,7 @@ else _rw_desc="read-write"; fi
 echo "▶ Launching sandbox (workdir: $WORKDIR [$_rw_desc], network: $NET_DESC)"
 echo "  Attach from another terminal: $0 --attach"
 echo "  Attach socket: $ATTACH_SOCK"
+echo "  Ctrl-C terminates the sandbox"
 notify sandbox_start ":rocket: Sandbox started — workdir: \`$(basename "$WORKDIR")\` [$_rw_desc], network: $NET_DESC, PID: $$"
 
 SANDBOX_INIT_SCRIPT='
@@ -1445,29 +1446,29 @@ snapshot_merge() {
   done
 }
 
-# When resource limits are set, run sandbox in background and wait so the
-# parent script (outside the cgroup) survives to detect OOM kills.
 if [[ ${#RESOURCE_WRAPPER[@]} -gt 0 ]]; then
   "${TIMEOUT_WRAPPER[@]+"${TIMEOUT_WRAPPER[@]}"}" "${RESOURCE_WRAPPER[@]}" "${BWRAP[@]}" -- bash -c "$SANDBOX_INIT_SCRIPT" -- "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}" &
-  SANDBOX_PID=$!
-  # Forward signals to the sandbox
-  trap 'kill -TERM $SANDBOX_PID 2>/dev/null; wait $SANDBOX_PID 2>/dev/null; cleanup' INT TERM
-  wait $SANDBOX_PID 2>/dev/null
-  SANDBOX_EXIT=$?
-  oom_check $SANDBOX_EXIT
-  timeout_check $SANDBOX_EXIT
-  diff_on_exit
-  quarantine_scan
-  snapshot_merge
-  notify sandbox_exit ":stop_sign: Sandbox exited (code: $SANDBOX_EXIT, workdir: \`$(basename "$WORKDIR")\`)"
-  exit $SANDBOX_EXIT
 else
-  "${TIMEOUT_WRAPPER[@]+"${TIMEOUT_WRAPPER[@]}"}" "${BWRAP[@]}" -- bash -c "$SANDBOX_INIT_SCRIPT" -- "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}"
-  SANDBOX_EXIT=$?
-  timeout_check $SANDBOX_EXIT
-  diff_on_exit
-  quarantine_scan
-  snapshot_merge
-  notify sandbox_exit ":stop_sign: Sandbox exited (code: $SANDBOX_EXIT, workdir: \`$(basename "$WORKDIR")\`)"
-  exit $SANDBOX_EXIT
+  "${TIMEOUT_WRAPPER[@]+"${TIMEOUT_WRAPPER[@]}"}" "${BWRAP[@]}" -- bash -c "$SANDBOX_INIT_SCRIPT" -- "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}" &
 fi
+SANDBOX_PID=$!
+
+forward_signal() {
+  local sig="$1"
+  kill "-$sig" "$SANDBOX_PID" 2>/dev/null || true
+  wait "$SANDBOX_PID" 2>/dev/null || true
+  cleanup
+}
+
+trap 'forward_signal INT' INT
+trap 'forward_signal TERM' TERM
+
+wait "$SANDBOX_PID" 2>/dev/null
+SANDBOX_EXIT=$?
+[[ ${#RESOURCE_WRAPPER[@]} -gt 0 ]] && oom_check "$SANDBOX_EXIT"
+timeout_check "$SANDBOX_EXIT"
+diff_on_exit
+quarantine_scan
+snapshot_merge
+notify sandbox_exit ":stop_sign: Sandbox exited (code: $SANDBOX_EXIT, workdir: \`$(basename "$WORKDIR")\`)"
+exit "$SANDBOX_EXIT"

@@ -447,11 +447,12 @@ function forward(method, urlPath, headers, body, res, verbose, onRetry) {
               return;
             }
             invalidateCache();
-            onRetry();
+            setImmediate(onRetry);
           });
           return;
         }
-        onRetry();
+        if (!res.headersSent) res.writeHead(upstream.statusCode, respHeaders);
+        res.end(respBody);
         return;
       }
 
