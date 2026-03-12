@@ -84,6 +84,7 @@ function parseArgs(argv) {
     auditLog:          null,    // path to audit log file
     notifyCommand:     null,
     notifyWebhook:     null,
+    autoRefreshAuth:   false,
     mcpBridgeSocket:   null,   // Unix socket for MCP auth proxy
     mcpBridgePort:     null,   // target TCP port of MCP server on localhost
     mcpBearerToken:    process.env.MCP_BEARER_TOKEN || null,   // Bearer token from env (not CLI)
@@ -102,6 +103,7 @@ function parseArgs(argv) {
       case '--idle-timeout':        args.idleTimeout   = parseInt(argv[++i], 10); break;
       case '--notify-command':     args.notifyCommand = argv[++i]; break;
       case '--notify-webhook':     args.notifyWebhook = argv[++i]; break;
+      case '--auto-refresh-auth':  args.autoRefreshAuth = true; break;
       case '--mcp-bridge-socket':  args.mcpBridgeSocket = argv[++i]; break;
       case '--mcp-bridge-port':    args.mcpBridgePort = parseInt(argv[++i], 10); break;
       // HIGH-3: bearer token read from MCP_BEARER_TOKEN env var (not CLI) to avoid /proc leak.
@@ -137,6 +139,7 @@ PROXY MODE (host side — claudebox.sh manages this automatically):
     --anthropic-tcp-port PORT   Host-side TCP bridge (default: ${DEFAULT_ANTHROPIC_PORT})
     --github-connect-port PORT  HTTPS CONNECT proxy port (default: ${DEFAULT_GITHUB_CONNECT_PORT})
     --enable-github             Add api.github.com to CONNECT allowlist
+    --auto-refresh-auth         Run a short host \`claude -p ...\` probe on 401, then retry once if the token changed
     --verbose
 
 BRIDGE-ONLY MODE (in-sandbox, for --no-network):
@@ -236,9 +239,50 @@ function getTotalTokens() { return _totalInputTokens + _totalOutputTokens; }
 let _forward_tokenLimit = 0;
 let _forward_notifyCommand = null;
 let _forward_notifyWebhook = null;
+let _forward_autoRefreshAuth = false;
+let _authRefreshPromise = null;
 
 function getTokenSummary() {
   return { input: _totalInputTokens, output: _totalOutputTokens, total: getTotalTokens(), requests: _totalRequests };
+}
+
+function parseJsonSafe(text) {
+  try { return JSON.parse(text); } catch (_) { return null; }
+}
+
+function isExpiredOauthResponse(statusCode, bodyText) {
+  if (statusCode !== 401 || typeof bodyText !== 'string' || bodyText.length === 0) return false;
+  const json = parseJsonSafe(bodyText);
+  const msg = String(
+    json?.error?.message ??
+    json?.message ??
+    bodyText
+  ).toLowerCase();
+  return msg.includes('oauth token has expired') ||
+    (msg.includes('refresh your existing token') && msg.includes('oauth'));
+}
+
+async function refreshHostAuth(verbose) {
+  if (_authRefreshPromise) return _authRefreshPromise;
+  _authRefreshPromise = new Promise((resolve) => {
+    const previousToken = getAccessToken();
+    console.warn('[auth] Received 401; probing host Claude to trigger token refresh');
+    const child = spawn('claude', ['-p', 'hi claude, may you be happy'], {
+      stdio: 'ignore',
+      env: process.env,
+    });
+    child.on('error', (err) => {
+      console.error('[auth] refresh command failed:', err.message);
+      resolve(false);
+    });
+    child.on('exit', (code) => {
+      if (verbose) console.log(`[auth] refresh command exited with ${code}`);
+      invalidateCache();
+      const nextToken = getAccessToken();
+      resolve(Boolean(previousToken && nextToken && nextToken !== previousToken));
+    });
+  }).finally(() => { _authRefreshPromise = null; });
+  return _authRefreshPromise;
 }
 
 // ---------------------------------------------------------------------------
@@ -367,11 +411,6 @@ function forward(method, urlPath, headers, body, res, verbose, onRetry) {
   const reqStartTime = Date.now();
   const req = https.request(opts, (upstream) => {
     if (verbose) console.log(`[anthropic] ← ${upstream.statusCode}`);
-    if (upstream.statusCode === 401 && onRetry) {
-      upstream.resume();
-      onRetry();
-      return;
-    }
     const respHeaders = filterResponseHeaders(upstream.headers);
     const isStreaming = (upstream.headers['content-type'] || '').includes('text/event-stream');
 
@@ -397,6 +436,24 @@ function forward(method, urlPath, headers, body, res, verbose, onRetry) {
       if (respAborted) return;
       const respBody = Buffer.concat(respChunks);
       const durationMs = Date.now() - reqStartTime;
+      const respText = isStreaming ? '' : respBody.toString('utf8');
+
+      if (upstream.statusCode === 401 && onRetry) {
+        if (_forward_autoRefreshAuth && isExpiredOauthResponse(upstream.statusCode, respText)) {
+          refreshHostAuth(verbose).then((ok) => {
+            if (!ok) {
+              if (!res.headersSent) res.writeHead(upstream.statusCode, respHeaders);
+              res.end(respBody);
+              return;
+            }
+            invalidateCache();
+            onRetry();
+          });
+          return;
+        }
+        onRetry();
+        return;
+      }
 
       // Extract usage from response
       let usage = null;
@@ -410,7 +467,7 @@ function forward(method, urlPath, headers, body, res, verbose, onRetry) {
             usage = lastData.usage || (lastData.message && lastData.message.usage) || null;
           }
         } else if (upstream.statusCode === 200) {
-          const json = JSON.parse(respBody.toString('utf8'));
+          const json = JSON.parse(respText);
           usage = json.usage || null;
         }
       } catch (e) { /* parse failure — skip usage tracking */ }
@@ -786,6 +843,7 @@ if (args.bridgeOnly) {
   _forward_tokenLimit = args.tokenLimit;
   _forward_notifyCommand = args.notifyCommand;
   _forward_notifyWebhook = args.notifyWebhook;
+  _forward_autoRefreshAuth = args.autoRefreshAuth;
 
   // Initialize audit log if configured
   if (args.auditLog) initAuditLog(args.auditLog);

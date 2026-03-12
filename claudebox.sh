@@ -52,6 +52,8 @@ SOCKET_MCP="$_SOCK_DIR/claude-proxy-mcp-$$.sock"
 SANDBOX_SOCKET_ANTHROPIC="/tmp/claude-proxy-anthropic.sock"
 SANDBOX_SOCKET_MCP="/tmp/claude-proxy-mcp.sock"
 SANDBOX_SOCKET_GITHUB="/tmp/claude-proxy-github.sock"
+SANDBOX_DUMMY_CREDS="/run/dummy-claude-credentials.json"
+SANDBOX_WORKDIR="/workspace"
 PORT_ANTHROPIC=58080
 PORT_GITHUB_CONNECT=58081   # HTTPS CONNECT proxy for api.github.com (in-sandbox bridge)
 SANDBOX_HOME="/home/sandbox"
@@ -64,6 +66,7 @@ BIND_BINARIES=false
 LAUNCH_SHELL=false
 ENABLE_GITHUB=false
 ENABLE_GITHUB_MCP=false
+AUTO_REFRESH_AUTH=false
 PORT_MCP=58082             # in-sandbox TCP port for MCP bridge
 MCP_SERVER_PID=""
 CLAUDE_ARGS=()
@@ -150,6 +153,7 @@ while [[ $# -gt 0 ]]; do
       echo "⚠ --enable-github is DEPRECATED: real GH_TOKEN enters the sandbox."
       echo "  Use --enable-github-mcp instead (token stays on host)."
       ENABLE_GITHUB=true; shift ;;
+    --auto-refresh-auth) AUTO_REFRESH_AUTH=true; shift ;;
     --disable-github)    ENABLE_GITHUB=false; shift ;;
     --gh-token-file)     GH_TOKEN_FILE=$2; shift 2 ;;
     --enable-github-mcp) ENABLE_GITHUB_MCP=true; shift ;;
@@ -218,8 +222,8 @@ USAGE:
   claudebox.sh [OPTIONS] [-- CLAUDE_ARGS...]
 
 OPTIONS:
-  --share-claude-dir     Mount ~/.claude read-only into the sandbox (history, settings, etc.)
-                         .credentials.json is automatically replaced with dummy tokens.
+  --share-claude-dir     Seed the sandbox with your host ~/.claude contents (history, settings, etc.)
+                         The host directory stays protected; .credentials.json is replaced with dummies.
   --share-sessions       Share session data (read-write) so conversations can be resumed
                          from the host or another sandbox. Mounts the project-specific
                          directory under ~/.claude/projects/ and ~/.claude/session-env/.
@@ -238,6 +242,8 @@ OPTIONS:
                          and github-mcp-server binary on host).
   --enable-github        Enable GitHub access via CONNECT proxy + gh CLI (unrecommended;
                          use --enable-github-mcp instead). Requires GH_TOKEN on host.
+  --auto-refresh-auth   On 401 responses, run a short host `claude -p ...` probe to let
+                        Claude refresh OAuth tokens, then retry once if the token changed.
   --gh-token-file FILE   Read GitHub PAT from FILE (default: ~/.config/claudebox/gh-token).
                          The GH_TOKEN env var takes priority if set.
   --mcp-port PORT        TCP port for MCP server bridge (default: 58082; range 1024-65535).
@@ -292,6 +298,10 @@ SECURITY PROPERTIES:
 EOF
       exit 0 ;;
     --) shift; CLAUDE_ARGS+=("$@"); break ;;
+    -*)
+      echo "❌ Unknown option: $1"
+      echo "   Use --help to see supported options."
+      exit 1 ;;
     *)  CLAUDE_ARGS+=("$1"); shift ;;
   esac
 done
@@ -490,6 +500,61 @@ if [[ "$BIND_BINARIES" == true ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Resolve dummy credentials file
+# ---------------------------------------------------------------------------
+if [[ -n "$DUMMY_CREDS_FILE" ]]; then
+  # MED-3: canonicalize to prevent symlink-based file leaks into sandbox.
+  DUMMY_CREDS_FILE=$(realpath --canonicalize-existing "$DUMMY_CREDS_FILE" 2>/dev/null) || {
+    echo "❌ --dummy-credentials: file not found: $DUMMY_CREDS_FILE"; exit 1; }
+  [[ -f "$DUMMY_CREDS_FILE" ]] || { echo "❌ --dummy-credentials: file not found: $DUMMY_CREDS_FILE"; exit 1; }
+  node -e "JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'))" "$DUMMY_CREDS_FILE" \
+    2>/dev/null || { echo "❌ --dummy-credentials: not valid JSON: $DUMMY_CREDS_FILE"; exit 1; }
+  TEMP_CREDS="$DUMMY_CREDS_FILE"
+  SESSION_DUMMY_TOKEN=$(node -e "
+const creds = JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8'));
+const token = creds?.claudeAiOauth?.accessToken ?? creds?.accessToken ?? '';
+if (!token || typeof token !== 'string') process.exit(1);
+process.stdout.write(token);
+" "$DUMMY_CREDS_FILE" 2>/dev/null) || {
+    echo "❌ --dummy-credentials: no access token found in $DUMMY_CREDS_FILE"; exit 1; }
+  export SESSION_DUMMY_TOKEN
+  echo "✔ Using provided dummy credentials: $DUMMY_CREDS_FILE"
+else
+  # Store in XDG_RUNTIME_DIR if available (private tmpfs), else /tmp (LOW-1)
+  _CREDS_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+  TEMP_CREDS=$(mktemp "$_CREDS_DIR/claude-dummy-creds-XXXXXX.json")
+  # HIGH-4: generate a per-session random dummy token so attackers who know the
+  # source code cannot forge proxy requests without stealing the session token.
+  SESSION_DUMMY_TOKEN=$(head -c 48 /dev/urandom | base64 | tr -d '/+=' | head -c 64)
+  SESSION_DUMMY_TOKEN="sk-ant-oat01-${SESSION_DUMMY_TOKEN}"
+  export SESSION_DUMMY_TOKEN  # used by proxy via environment
+
+  node - "$TEMP_CREDS" <<'NODEEOF'
+const fs = require('fs'), os = require('os'), path = require('path');
+const dest = process.argv[2];
+const DUMMY  = process.env.SESSION_DUMMY_TOKEN;
+const DUMMYR = 'sk-ant-ort01-dummyRefreshDummyRefreshDummyRefreshDummyRefreshDummy';
+let creds = null;
+for (const p of [
+  path.join(os.homedir(), '.claude', '.credentials.json'),
+  path.join(os.homedir(), '.config', 'claude', 'auth.json'),
+]) {
+  try { creds = JSON.parse(fs.readFileSync(p, 'utf8')); break; } catch (_) {}
+}
+if (!creds) {
+  creds = { claudeAiOauth: { accessToken: DUMMY, refreshToken: DUMMYR } };
+} else if (creds.claudeAiOauth) {
+  creds.claudeAiOauth.accessToken  = DUMMY;
+  creds.claudeAiOauth.refreshToken = DUMMYR;
+} else {
+  creds.accessToken = DUMMY;
+}
+fs.writeFileSync(dest, JSON.stringify(creds, null, 2));
+NODEEOF
+  echo "✔ Dummy credentials ready (auto-generated)"
+fi
+
+# ---------------------------------------------------------------------------
 # Start credential proxy on the host
 # ---------------------------------------------------------------------------
 echo "▶ Starting credential proxy"
@@ -503,6 +568,7 @@ if [[ "$ISOLATE_NET" == false ]]; then
   PROXY_ARGS+=(--github-connect-port "$PORT_GITHUB_CONNECT")
 fi
 [[ "$ENABLE_GITHUB" == true ]] && PROXY_ARGS+=(--enable-github)
+[[ "$AUTO_REFRESH_AUTH" == true ]] && PROXY_ARGS+=(--auto-refresh-auth)
 for _url in "${ALLOWLIST_URLS[@]+"${ALLOWLIST_URLS[@]}"}"; do
   PROXY_ARGS+=(--connect-allowlist "$_url")
 done
@@ -556,53 +622,6 @@ if [[ ${#ALLOWLIST_URLS[@]} -gt 0 ]]; then
   [[ "$_gh_desc" == "none" ]] && _gh_desc="$_extra" || _gh_desc="${_gh_desc},${_extra}"
 fi
 echo "✔ Proxy ready (anthropic=$SOCKET_ANTHROPIC, github=$SOCKET_GITHUB, allowlist=$_gh_desc)"
-
-# ---------------------------------------------------------------------------
-# Resolve dummy credentials file
-# ---------------------------------------------------------------------------
-if [[ -n "$DUMMY_CREDS_FILE" ]]; then
-  # MED-3: canonicalize to prevent symlink-based file leaks into sandbox.
-  DUMMY_CREDS_FILE=$(realpath --canonicalize-existing "$DUMMY_CREDS_FILE" 2>/dev/null) || {
-    echo "❌ --dummy-credentials: file not found: $DUMMY_CREDS_FILE"; exit 1; }
-  [[ -f "$DUMMY_CREDS_FILE" ]] || { echo "❌ --dummy-credentials: file not found: $DUMMY_CREDS_FILE"; exit 1; }
-  node -e "JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'))" "$DUMMY_CREDS_FILE" \
-    2>/dev/null || { echo "❌ --dummy-credentials: not valid JSON: $DUMMY_CREDS_FILE"; exit 1; }
-  TEMP_CREDS="$DUMMY_CREDS_FILE"
-  echo "✔ Using provided dummy credentials: $DUMMY_CREDS_FILE"
-else
-  # Store in XDG_RUNTIME_DIR if available (private tmpfs), else /tmp (LOW-1)
-  _CREDS_DIR="${XDG_RUNTIME_DIR:-/tmp}"
-  TEMP_CREDS=$(mktemp "$_CREDS_DIR/claude-dummy-creds-XXXXXX.json")
-  # HIGH-4: generate a per-session random dummy token so attackers who know the
-  # source code cannot forge proxy requests without stealing the session token.
-  SESSION_DUMMY_TOKEN=$(head -c 48 /dev/urandom | base64 | tr -d '/+=' | head -c 64)
-  SESSION_DUMMY_TOKEN="sk-ant-oat01-${SESSION_DUMMY_TOKEN}"
-  export SESSION_DUMMY_TOKEN  # used by proxy via environment
-
-  node - "$TEMP_CREDS" <<'NODEEOF'
-const fs = require('fs'), os = require('os'), path = require('path');
-const dest = process.argv[2];
-const DUMMY  = process.env.SESSION_DUMMY_TOKEN;
-const DUMMYR = 'sk-ant-ort01-dummyRefreshDummyRefreshDummyRefreshDummyRefreshDummy';
-let creds = null;
-for (const p of [
-  path.join(os.homedir(), '.claude', '.credentials.json'),
-  path.join(os.homedir(), '.config', 'claude', 'auth.json'),
-]) {
-  try { creds = JSON.parse(fs.readFileSync(p, 'utf8')); break; } catch (_) {}
-}
-if (!creds) {
-  creds = { claudeAiOauth: { accessToken: DUMMY, refreshToken: DUMMYR } };
-} else if (creds.claudeAiOauth) {
-  creds.claudeAiOauth.accessToken  = DUMMY;
-  creds.claudeAiOauth.refreshToken = DUMMYR;
-} else {
-  creds.accessToken = DUMMY;
-}
-fs.writeFileSync(dest, JSON.stringify(creds, null, 2));
-NODEEOF
-  echo "✔ Dummy credentials ready (auto-generated)"
-fi
 
 # ---------------------------------------------------------------------------
 # Build bwrap command
@@ -754,7 +773,7 @@ BWRAP=(
   --setenv _ENABLE_GITHUB    "$ENABLE_GITHUB"
   --setenv _LAUNCH_SHELL     "$LAUNCH_SHELL"
 
-  --chdir /workspace
+  --chdir "$SANDBOX_WORKDIR"
 )
 
 # Home directory: cache-home uses persistent bind mount; default uses tmpfs
@@ -774,11 +793,11 @@ fi
 # Workdir bind mount: snapshot (staging copy), ro, or rw
 if [[ "$SNAPSHOT" == true ]]; then
   # Snapshot: bind the staging copy (rw), original workdir untouched
-  BWRAP+=(--bind "$SNAPSHOT_STAGING" /workspace)
+  BWRAP+=(--bind "$SNAPSHOT_STAGING" "$SANDBOX_WORKDIR")
 elif [[ "$READONLY_WORKDIR" == true ]]; then
-  BWRAP+=(--ro-bind "$WORKDIR" /workspace)
+  BWRAP+=(--ro-bind "$WORKDIR" "$SANDBOX_WORKDIR")
 else
-  BWRAP+=(--bind "$WORKDIR" /workspace)
+  BWRAP+=(--bind "$WORKDIR" "$SANDBOX_WORKDIR")
 fi
 
 # GitHub: real GH_TOKEN passed directly (TLS tunnel prevents proxy injection).
@@ -815,8 +834,10 @@ fi
 
 # ~/.claude sharing
 if [[ "$SHARE_CLAUDE_DIR" == true && -d "$HOME/.claude" ]]; then
-  BWRAP+=(--ro-bind "$HOME/.claude" "$SANDBOX_HOME/.claude")
-  BWRAP+=(--ro-bind "$TEMP_CREDS"   "$SANDBOX_HOME/.claude/.credentials.json")
+  # Seed from a host snapshot instead of mounting ~/.claude read-only so
+  # Claude can update sandbox-local files like settings.local.json on exit.
+  BWRAP+=(--ro-bind "$HOME/.claude" /run/host-claude)
+  BWRAP+=(--ro-bind "$TEMP_CREDS" "$SANDBOX_DUMMY_CREDS")
 else
   BWRAP+=(--dir     "$SANDBOX_HOME/.claude")
   BWRAP+=(--ro-bind "$TEMP_CREDS" "$SANDBOX_HOME/.claude/.credentials.json")
@@ -829,12 +850,15 @@ fi
 # Session sharing: bind-mount project-specific conversation data (rw) so that
 # sessions can be resumed from the host or another sandbox.
 # Claude Code stores sessions in ~/.claude/projects/<project-dir-name>/.
-# The project dir name is the workdir path with / replaced by -.
+# Use separate host and sandbox project names so the host session directory
+# stays stable while the sandbox path matches the visible mountpoint.
 if [[ "$SHARE_SESSIONS" == true ]]; then
-  # Compute project directory name: /home/user/work/foo → -home-user-work-foo
-  _project_dir_name=$(echo "$WORKDIR" | tr '/' '-')
-  _host_project_dir="$HOME/.claude/projects/$_project_dir_name"
-  _sandbox_project_dir="$SANDBOX_HOME/.claude/projects/$_project_dir_name"
+  # Host key: /home/user/work/foo -> -home-user-work-foo
+  _host_project_dir_name=$(echo "$WORKDIR" | tr '/' '-')
+  # Sandbox key follows the path Claude sees, e.g. /workspace -> -workspace.
+  _sandbox_project_dir_name=$(echo "$SANDBOX_WORKDIR" | tr '/' '-')
+  _host_project_dir="$HOME/.claude/projects/$_host_project_dir_name"
+  _sandbox_project_dir="$SANDBOX_HOME/.claude/projects/$_sandbox_project_dir_name"
 
   # Create host-side directories if they don't exist
   mkdir -p "$_host_project_dir"
@@ -858,7 +882,7 @@ if [[ "$SHARE_SESSIONS" == true ]]; then
     BWRAP+=(--ro-bind "$HOME/.claude/history.jsonl" "$SANDBOX_HOME/.claude/history.jsonl")
   fi
 
-  echo "✔ Session sharing enabled (project: $_project_dir_name)"
+  echo "✔ Session sharing enabled (host: $_host_project_dir_name, sandbox: $_sandbox_project_dir_name)"
   # HIGH-2: warn about session resume risk — sandboxed code can write crafted
   # JSONL that replays on the host when resumed without a sandbox.
   echo "  ⚠ When resuming shared sessions on the host, review conversation history first."
@@ -1113,6 +1137,16 @@ SANDBOX_INIT_SCRIPT='
   # MED-6: --no-dereference prevents symlinks in the seed dir from leaking host files.
   if [[ -d /run/sandbox-home-seed ]]; then
     cp --no-dereference --no-preserve=mode,ownership -rT /run/sandbox-home-seed "$HOME"
+  fi
+
+  if [[ -d /run/host-claude ]]; then
+    mkdir -p "$HOME/.claude"
+    cp --no-dereference --no-preserve=mode,ownership -r /run/host-claude/. "$HOME/.claude/"
+  fi
+
+  if [[ -f /run/dummy-claude-credentials.json ]]; then
+    mkdir -p "$HOME/.claude"
+    cp --no-dereference --no-preserve=mode,ownership /run/dummy-claude-credentials.json "$HOME/.claude/.credentials.json"
   fi
 
   printf '\''{"hasCompletedOnboarding": true, "installMethod": "native"}'\'' > "$HOME/.claude.json"
