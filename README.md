@@ -124,7 +124,7 @@ GH_TOKEN=ghp_xxx ./claudebox.sh --enable-github
 --shell                Launch bash instead of claude (useful for debugging).
 --attach               Attach to a running sandbox from another terminal.
 --mount-claude-md      Mount ~/.claude/CLAUDE.md into sandbox (read-only).
---share-claude-dir     Mount entire ~/.claude read-only (credentials replaced with dummies).
+--share-claude-dir     Seed sandbox ~/.claude from the host (credentials replaced with dummies).
 --sandbox-home DIR     Copy files from DIR into sandbox home at startup.
 --enable-github-mcp    Enable GitHub access via MCP server (recommended). Requires GH_TOKEN
                        (env or ~/.config/claudebox/gh-token) and github-mcp-server on host.

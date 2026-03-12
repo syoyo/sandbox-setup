@@ -729,6 +729,12 @@ if (!creds) {
 } else if (creds.claudeAiOauth) {
   creds.claudeAiOauth.accessToken  = DUMMY;
   creds.claudeAiOauth.refreshToken = DUMMYR;
+  // Set expiresAt far in the future so sandbox Claude never attempts a
+  // client-side token refresh (which can't work with a dummy refresh token
+  // in a network-isolated sandbox).  The proxy handles real auth on the host.
+  if (creds.claudeAiOauth.expiresAt !== undefined) {
+    creds.claudeAiOauth.expiresAt = Date.now() + 365 * 24 * 60 * 60 * 1000;
+  }
 } else {
   creds.accessToken = DUMMY;
 }
