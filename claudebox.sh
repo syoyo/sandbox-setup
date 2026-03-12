@@ -32,6 +32,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROXY_SCRIPT="$SCRIPT_DIR/credential-proxy.js"
+ORIGINAL_ARGS=("$@")
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -56,6 +57,8 @@ SANDBOX_DUMMY_CREDS="/run/dummy-claude-credentials.json"
 SANDBOX_WORKDIR="/workspace"
 PORT_ANTHROPIC=58080
 PORT_GITHUB_CONNECT=58081   # HTTPS CONNECT proxy for api.github.com (in-sandbox bridge)
+HOST_PORT_ANTHROPIC=""
+HOST_PORT_GITHUB_CONNECT=""
 SANDBOX_HOME="/home/sandbox"
 WORKDIR="$(pwd)"
 MOUNT_CLAUDE_MD=false
@@ -68,6 +71,7 @@ ENABLE_GITHUB=false
 ENABLE_GITHUB_MCP=false
 AUTO_REFRESH_AUTH=false
 PORT_MCP=58082             # in-sandbox TCP port for MCP bridge
+HOST_PORT_MCP_SERVER=""
 MCP_SERVER_PID=""
 CLAUDE_ARGS=()
 PROXY_PID=""
@@ -78,6 +82,9 @@ MEM_LIMIT=""           # e.g. 4G, 8G, 512M
 CPU_LIMIT=""           # percentage: 100 = 1 core, 200 = 2 cores
 IDLE_TIMEOUT=15        # minutes: warn if no Anthropic request for this long (0=disable)
 ATTACH_MODE=false      # --attach: connect to existing sandbox
+ATTACH_TARGET=""
+LIST_MODE=false
+INFO_TARGET=""
 NOTIFY_COMMAND=""      # shell command for event notifications
 NOTIFY_WEBHOOK=""      # webhook URL for event notifications (Slack, etc.)
 GH_TOKEN_FILE=""       # file containing GitHub PAT (alternative to GH_TOKEN env var)
@@ -169,7 +176,19 @@ while [[ $# -gt 0 ]]; do
     --idle-timeout)
       [[ "$2" =~ ^[0-9]+$ ]] || { echo "❌ --idle-timeout: invalid value '$2' (minutes)"; exit 1; }
       IDLE_TIMEOUT=$2; shift 2 ;;
-    --attach)  ATTACH_MODE=true; shift ;;
+    --attach)
+      ATTACH_MODE=true
+      if [[ $# -gt 1 && "${2:-}" != --* ]]; then
+        ATTACH_TARGET=$2
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    --list) LIST_MODE=true; shift ;;
+    --info)
+      [[ $# -ge 2 ]] || { echo "❌ --info requires a sandbox ID"; exit 1; }
+      INFO_TARGET=$2; shift 2 ;;
     --notify-command)  NOTIFY_COMMAND=$2; shift 2 ;;
     --notify-webhook)
       # MED-1: only allow https webhooks to prevent SSRF to internal services.
@@ -270,7 +289,9 @@ OPTIONS:
   --mem-limit SIZE       Memory limit (e.g. 4G, 512M). Uses cgroups via systemd-run.
   --cpu-limit PERCENT    CPU limit as percentage (100 = 1 core, 200 = 2 cores).
   --idle-timeout MINS    Warn when no Anthropic API request for MINS minutes (default: 15, 0=off).
-  --attach               Attach to an existing sandbox (connect to its shell socket).
+  --attach [ID]          Attach to an existing sandbox (latest by default).
+  --list                 List current sandboxes with workspace and status info.
+  --info ID              Show detailed info for one sandbox, including launch args.
   --notify-command CMD   Run CMD on events (env: CLAUDEBOX_EVENT, CLAUDEBOX_MESSAGE).
   --notify-webhook URL   POST JSON to URL on events (Slack incoming webhook compatible).
   --anthropic-port PORT  TCP port for Anthropic proxy bridge (default: 58080; range 1024-65535)
@@ -311,22 +332,167 @@ done
 # ---------------------------------------------------------------------------
 ATTACH_DIR="$_SOCK_DIR/claudebox-attach-$$"
 ATTACH_SOCK="$ATTACH_DIR/shell.sock"
+METADATA_FILE="$ATTACH_DIR/metadata.env"
+
+shell_join() {
+  local out="" arg
+  for arg in "$@"; do
+    printf -v arg '%q' "$arg"
+    out+="${out:+ }$arg"
+  done
+  printf '%s' "$out"
+}
+
+allocate_free_port() {
+  node -e '
+const net = require("net");
+const server = net.createServer();
+server.listen(0, "127.0.0.1", () => {
+  const addr = server.address();
+  process.stdout.write(String(addr.port));
+  server.close(() => process.exit(0));
+});
+server.on("error", () => process.exit(1));
+'
+}
+
+allocate_sandbox_id() {
+  local next=1 _meta
+  declare -A used=()
+  for _meta in "$_SOCK_DIR"/claudebox-attach-*/metadata.env; do
+    [[ -f "$_meta" ]] || continue
+    unset SANDBOX_ID
+    # shellcheck disable=SC1090
+    source "$_meta"
+    [[ "${SANDBOX_ID:-}" =~ ^[0-9]+$ ]] || continue
+    used["$SANDBOX_ID"]=1
+  done
+  while [[ -n "${used[$next]:-}" ]]; do
+    next=$((next + 1))
+  done
+  printf '%s\n' "$next"
+}
+
+find_sandbox_metadata() {
+  local target="${1:-}" latest="" found=""
+  for _meta in "$_SOCK_DIR"/claudebox-attach-*/metadata.env; do
+    [[ -f "$_meta" ]] || continue
+    latest="$_meta"
+    if [[ -n "$target" ]]; then
+      unset SANDBOX_ID ATTACH_SOCKET
+      # shellcheck disable=SC1090
+      source "$_meta"
+      if [[ "${SANDBOX_ID:-}" == "$target" || "${ATTACH_SOCKET:-}" == "$target" ]]; then
+        found="$_meta"
+      fi
+    fi
+  done
+  if [[ -n "$target" ]]; then
+    [[ -n "$found" ]] && printf '%s\n' "$found"
+  else
+    [[ -n "$latest" ]] && printf '%s\n' "$latest"
+  fi
+}
+
+print_sandbox_list() {
+  local count=0 _meta _rows=() _row _id _workspace _status _started _workdir
+  printf '%-8s %-14s %-8s %-10s %s\n' "ID" "Workspace" "Status" "Started" "Workdir"
+  for _meta in "$_SOCK_DIR"/claudebox-attach-*/metadata.env; do
+    [[ -f "$_meta" ]] || continue
+    unset SANDBOX_ID WORKDIR_PATH WORKSPACE_NAME STARTED_AT ATTACH_SOCKET SANDBOX_PID LAUNCH_MODE NETWORK_MODE
+    # shellcheck disable=SC1090
+    source "$_meta"
+    count=$((count + 1))
+    _status="stopped"
+    if [[ -n "${ATTACH_SOCKET:-}" && -S "${ATTACH_SOCKET:-}" ]]; then
+      _status="running"
+    elif [[ -n "${SANDBOX_PID:-}" ]] && kill -0 "$SANDBOX_PID" 2>/dev/null; then
+      _status="running"
+    fi
+    _started_short="${STARTED_AT:-unknown}"
+    [[ "${_started_short}" == *T* ]] && _started_short="${_started_short#*T}"
+    [[ "${_started_short}" == *+* ]] && _started_short="${_started_short%%+*}"
+    _rows+=("${SANDBOX_ID:-9999999}|${WORKSPACE_NAME:-unknown}|$_status|$_started_short|${WORKDIR_PATH:-unknown}")
+  done
+  if [[ $count -eq 0 ]]; then
+    echo "(no sandboxes found)"
+    return 0
+  fi
+  while IFS= read -r _row; do
+    IFS='|' read -r _id _workspace _status _started _workdir <<< "$_row"
+    printf '%-8s %-14s %-8s %-10s %s\n' "$_id" "$_workspace" "$_status" "$_started" "$_workdir"
+  done < <(printf '%s\n' "${_rows[@]}" | sort -t'|' -k1,1n)
+}
+
+print_sandbox_info() {
+  local meta="$1"
+  unset SANDBOX_ID WORKDIR_PATH WORKSPACE_NAME STARTED_AT ATTACH_SOCKET SANDBOX_PID LAUNCH_MODE NETWORK_MODE
+  unset SHARE_SESSIONS_MODE SHARE_CLAUDE_DIR_MODE BIND_BINARIES_MODE ENABLE_GITHUB_MCP_MODE ENABLE_GITHUB_MODE
+  unset READONLY_WORKDIR_MODE SNAPSHOT_MODE IMAGE_ROOT PORT_ANTHROPIC_META PORT_GITHUB_META PORT_MCP_META
+  unset HOST_PORT_ANTHROPIC_META HOST_PORT_GITHUB_META HOST_PORT_MCP_SERVER_META
+  unset CLAUDE_ARGS_SHELL CLAUDEBOX_ARGS_SHELL
+  # shellcheck disable=SC1090
+  source "$meta"
+  _status="stopped"
+  if [[ -n "${ATTACH_SOCKET:-}" && -S "${ATTACH_SOCKET:-}" ]]; then
+    _status="running"
+  elif [[ -n "${SANDBOX_PID:-}" ]] && kill -0 "$SANDBOX_PID" 2>/dev/null; then
+    _status="running"
+  fi
+  cat <<EOF
+ID: ${SANDBOX_ID:-unknown}
+Status: $_status
+Workspace: ${WORKSPACE_NAME:-unknown}
+Workdir: ${WORKDIR_PATH:-unknown}
+Started: ${STARTED_AT:-unknown}
+Attach socket: ${ATTACH_SOCKET:-unknown}
+Sandbox PID: ${SANDBOX_PID:-unknown}
+Launch mode: ${LAUNCH_MODE:-unknown}
+Network: ${NETWORK_MODE:-unknown}
+Share sessions: ${SHARE_SESSIONS_MODE:-unknown}
+Share .claude: ${SHARE_CLAUDE_DIR_MODE:-unknown}
+Bind binaries: ${BIND_BINARIES_MODE:-unknown}
+GitHub MCP: ${ENABLE_GITHUB_MCP_MODE:-unknown}
+GitHub CONNECT: ${ENABLE_GITHUB_MODE:-unknown}
+Read-only workdir: ${READONLY_WORKDIR_MODE:-unknown}
+Snapshot: ${SNAPSHOT_MODE:-unknown}
+Image rootfs: ${IMAGE_ROOT:-none}
+Ports: anthropic=${PORT_ANTHROPIC_META:-unknown} github=${PORT_GITHUB_META:-unknown} mcp=${PORT_MCP_META:-unknown}
+Host ports: anthropic=${HOST_PORT_ANTHROPIC_META:-unknown} github=${HOST_PORT_GITHUB_META:-unknown} mcp-server=${HOST_PORT_MCP_SERVER_META:-unknown}
+claudebox args: ${CLAUDEBOX_ARGS_SHELL:-}
+claude args: ${CLAUDE_ARGS_SHELL:-}
+EOF
+}
 
 # ---------------------------------------------------------------------------
 # --attach: connect to an existing sandbox's shell socket
 # ---------------------------------------------------------------------------
+if [[ "$LIST_MODE" == true ]]; then
+  print_sandbox_list
+  exit 0
+fi
+
+if [[ -n "$INFO_TARGET" ]]; then
+  _info_meta=$(find_sandbox_metadata "$INFO_TARGET")
+  [[ -n "$_info_meta" ]] || { echo "❌ No sandbox found for: $INFO_TARGET"; exit 1; }
+  print_sandbox_info "$_info_meta"
+  exit 0
+fi
+
 if [[ "$ATTACH_MODE" == true ]]; then
-  # Find the most recent attach socket
-  _found_sock=""
-  for _d in "$_SOCK_DIR"/claudebox-attach-*/shell.sock; do
-    [[ -S "$_d" ]] && _found_sock="$_d"
-  done
-  if [[ -z "$_found_sock" ]]; then
-    echo "❌ No running sandbox found (no attach socket in $_SOCK_DIR/claudebox-attach-*/)"
-    echo "   Tip: list available sockets with: ls $_SOCK_DIR/claudebox-attach-*/shell.sock"
+  _attach_meta=$(find_sandbox_metadata "$ATTACH_TARGET")
+  [[ -n "$_attach_meta" ]] || {
+    echo "❌ No running sandbox found${ATTACH_TARGET:+ for: $ATTACH_TARGET}"
+    echo "   Tip: use --list to see available sandboxes"
     exit 1
-  fi
-  echo "▶ Attaching to sandbox: $_found_sock"
+  }
+  unset ATTACH_SOCKET SANDBOX_ID WORKSPACE_NAME
+  # shellcheck disable=SC1090
+  source "$_attach_meta"
+  _found_sock="${ATTACH_SOCKET:-}"
+  [[ -n "$_found_sock" && -S "$_found_sock" ]] || { echo "❌ Attach socket missing for sandbox: ${SANDBOX_ID:-unknown}"; exit 1; }
+  echo "▶ Attaching to sandbox: ${SANDBOX_ID:-unknown} (${WORKSPACE_NAME:-unknown})"
+  echo "  Socket: $_found_sock"
   echo "  (Ctrl-C to detach)"
   exec socat -,raw,echo=0 UNIX-CONNECT:"$_found_sock"
 fi
@@ -338,6 +504,22 @@ fi
   echo "❌ --anthropic-port and --github-port must be different"; exit 1; }
 [[ "$PORT_ANTHROPIC" -ne "$PORT_MCP" && "$PORT_GITHUB_CONNECT" -ne "$PORT_MCP" ]] || {
   echo "❌ --mcp-port must differ from --anthropic-port and --github-port"; exit 1; }
+
+if [[ "$ISOLATE_NET" == true ]]; then
+  HOST_PORT_ANTHROPIC=$(allocate_free_port) || { echo "❌ failed to allocate host Anthropic bridge port"; exit 1; }
+  HOST_PORT_GITHUB_CONNECT=$(allocate_free_port) || { echo "❌ failed to allocate host GitHub bridge port"; exit 1; }
+  while [[ "$HOST_PORT_GITHUB_CONNECT" == "$HOST_PORT_ANTHROPIC" ]]; do
+    HOST_PORT_GITHUB_CONNECT=$(allocate_free_port) || { echo "❌ failed to allocate host GitHub bridge port"; exit 1; }
+  done
+  HOST_PORT_MCP_SERVER=$(allocate_free_port) || { echo "❌ failed to allocate host MCP server port"; exit 1; }
+  while [[ "$HOST_PORT_MCP_SERVER" == "$HOST_PORT_ANTHROPIC" || "$HOST_PORT_MCP_SERVER" == "$HOST_PORT_GITHUB_CONNECT" ]]; do
+    HOST_PORT_MCP_SERVER=$(allocate_free_port) || { echo "❌ failed to allocate host MCP server port"; exit 1; }
+  done
+else
+  HOST_PORT_ANTHROPIC="$PORT_ANTHROPIC"
+  HOST_PORT_GITHUB_CONNECT="$PORT_GITHUB_CONNECT"
+  HOST_PORT_MCP_SERVER="$PORT_MCP"
+fi
 
 # ---------------------------------------------------------------------------
 # Load GH_TOKEN from file if --gh-token-file or default location
@@ -414,6 +596,7 @@ cleanup() {
     [[ -f "$SECCOMP_BPF" ]] && rm -f "$SECCOMP_BPF" 2>/dev/null || true
     exec 9<&- 2>/dev/null || true
   fi
+  rm -f "$METADATA_FILE" 2>/dev/null || true
   rm -rf "$ATTACH_DIR" 2>/dev/null || true
   [[ -n "$TEMP_CREDS" && -f "$TEMP_CREDS" && -z "$DUMMY_CREDS_FILE" ]] && rm -f "$TEMP_CREDS" || true
   # HIGH-4: clean up private temp dir if we created it
@@ -562,11 +745,9 @@ PROXY_ARGS=(
   --anthropic-socket "$SOCKET_ANTHROPIC"
   # CONNECT proxy: Unix socket for bind-mounting into sandbox.
   --github-socket "$SOCKET_GITHUB"
+  --anthropic-tcp-port "$HOST_PORT_ANTHROPIC"
+  --github-connect-port "$HOST_PORT_GITHUB_CONNECT"
 )
-if [[ "$ISOLATE_NET" == false ]]; then
-  PROXY_ARGS+=(--anthropic-tcp-port "$PORT_ANTHROPIC")
-  PROXY_ARGS+=(--github-connect-port "$PORT_GITHUB_CONNECT")
-fi
 [[ "$ENABLE_GITHUB" == true ]] && PROXY_ARGS+=(--enable-github)
 [[ "$AUTO_REFRESH_AUTH" == true ]] && PROXY_ARGS+=(--auto-refresh-auth)
 for _url in "${ALLOWLIST_URLS[@]+"${ALLOWLIST_URLS[@]}"}"; do
@@ -579,20 +760,20 @@ done
 if [[ "$ENABLE_GITHUB_MCP" == true ]]; then
   [[ -n "${GH_TOKEN:-}" ]] || { echo "❌ --enable-github-mcp requires GH_TOKEN to be set on the host"; exit 1; }
   command -v github-mcp-server >/dev/null 2>&1 || { echo "❌ github-mcp-server not found (install from https://github.com/github/github-mcp-server)"; exit 1; }
-  echo "▶ Starting GitHub MCP server (HTTP mode, port $PORT_MCP)"
-  GITHUB_PERSONAL_ACCESS_TOKEN="$GH_TOKEN" github-mcp-server http --port "$PORT_MCP" &
+  echo "▶ Starting GitHub MCP server (HTTP mode, host port $HOST_PORT_MCP_SERVER)"
+  GITHUB_PERSONAL_ACCESS_TOKEN="$GH_TOKEN" github-mcp-server http --port "$HOST_PORT_MCP_SERVER" &
   MCP_SERVER_PID=$!
   # Wait for MCP server to be ready
   for _i in $(seq 1 30); do
-    (echo >/dev/tcp/127.0.0.1/"$PORT_MCP") 2>/dev/null && break || true
+    (echo >/dev/tcp/127.0.0.1/"$HOST_PORT_MCP_SERVER") 2>/dev/null && break || true
     sleep 0.2
     kill -0 "$MCP_SERVER_PID" 2>/dev/null || { echo "❌ GitHub MCP server died"; exit 1; }
   done
-  (echo >/dev/tcp/127.0.0.1/"$PORT_MCP") 2>/dev/null || { echo "❌ GitHub MCP server did not start"; exit 1; }
-  echo "✔ GitHub MCP server ready (port $PORT_MCP)"
+  (echo >/dev/tcp/127.0.0.1/"$HOST_PORT_MCP_SERVER") 2>/dev/null || { echo "❌ GitHub MCP server did not start"; exit 1; }
+  echo "✔ GitHub MCP server ready (host port $HOST_PORT_MCP_SERVER)"
   # HIGH-3: pass bearer token via env var, not CLI arg (avoids /proc/PID/cmdline leak).
   export MCP_BEARER_TOKEN="$GH_TOKEN"
-  PROXY_ARGS+=(--mcp-bridge-socket "$SOCKET_MCP" --mcp-bridge-port "$PORT_MCP")
+  PROXY_ARGS+=(--mcp-bridge-socket "$SOCKET_MCP" --mcp-bridge-port "$HOST_PORT_MCP_SERVER")
 fi
 [[ "$IDLE_TIMEOUT" -gt 0 ]] && PROXY_ARGS+=(--idle-timeout "$IDLE_TIMEOUT")
 [[ -n "$NOTIFY_COMMAND" ]] && PROXY_ARGS+=(--notify-command "$NOTIFY_COMMAND")
@@ -645,6 +826,38 @@ system_dir_args() {
 # Create attach socket directory (host-side, bind-mounted rw into sandbox)
 mkdir -p "$ATTACH_DIR"
 chmod 700 "$ATTACH_DIR"
+
+WORKSPACE_NAME="$(basename "$WORKDIR")"
+STARTED_AT="$(date -Is)"
+SANDBOX_ID="$(allocate_sandbox_id)"
+CLAUDEBOX_ARGS_SHELL="$(shell_join "${ORIGINAL_ARGS[@]}")"
+CLAUDE_ARGS_SHELL="$(shell_join "${CLAUDE_ARGS[@]}")"
+cat > "$METADATA_FILE" <<EOF
+SANDBOX_ID=$(printf '%q' "$SANDBOX_ID")
+WORKDIR_PATH=$(printf '%q' "$WORKDIR")
+WORKSPACE_NAME=$(printf '%q' "$WORKSPACE_NAME")
+STARTED_AT=$(printf '%q' "$STARTED_AT")
+ATTACH_SOCKET=$(printf '%q' "$ATTACH_SOCK")
+SANDBOX_PID=$(printf '%q' "")
+LAUNCH_MODE=$(printf '%q' "$([[ "$LAUNCH_SHELL" == true ]] && echo shell || echo claude)")
+NETWORK_MODE=$(printf '%q' "$([[ "$ISOLATE_NET" == true ]] && echo isolated || echo shared)")
+SHARE_SESSIONS_MODE=$(printf '%q' "$SHARE_SESSIONS")
+SHARE_CLAUDE_DIR_MODE=$(printf '%q' "$SHARE_CLAUDE_DIR")
+BIND_BINARIES_MODE=$(printf '%q' "$BIND_BINARIES")
+ENABLE_GITHUB_MCP_MODE=$(printf '%q' "$ENABLE_GITHUB_MCP")
+ENABLE_GITHUB_MODE=$(printf '%q' "$ENABLE_GITHUB")
+READONLY_WORKDIR_MODE=$(printf '%q' "$READONLY_WORKDIR")
+SNAPSHOT_MODE=$(printf '%q' "$SNAPSHOT")
+IMAGE_ROOT=$(printf '%q' "${IMAGE:-}")
+PORT_ANTHROPIC_META=$(printf '%q' "$PORT_ANTHROPIC")
+PORT_GITHUB_META=$(printf '%q' "$PORT_GITHUB_CONNECT")
+PORT_MCP_META=$(printf '%q' "$PORT_MCP")
+HOST_PORT_ANTHROPIC_META=$(printf '%q' "$HOST_PORT_ANTHROPIC")
+HOST_PORT_GITHUB_META=$(printf '%q' "$HOST_PORT_GITHUB_CONNECT")
+HOST_PORT_MCP_SERVER_META=$(printf '%q' "$HOST_PORT_MCP_SERVER")
+CLAUDEBOX_ARGS_SHELL=$(printf '%q' "$CLAUDEBOX_ARGS_SHELL")
+CLAUDE_ARGS_SHELL=$(printf '%q' "$CLAUDE_ARGS_SHELL")
+EOF
 
 # Common host /etc paths needed for networking, SSL, and time
 _HOST_ETC_OVERRIDES=(
@@ -772,6 +985,7 @@ BWRAP=(
   --setenv _ISOLATE_NET      "$ISOLATE_NET"
   --setenv _ENABLE_GITHUB    "$ENABLE_GITHUB"
   --setenv _LAUNCH_SHELL     "$LAUNCH_SHELL"
+  --setenv _SHARE_SESSIONS   "$SHARE_SESSIONS"
 
   --chdir "$SANDBOX_WORKDIR"
 )
@@ -892,16 +1106,18 @@ fi
 # with no group/world write permission.
 SANDBOX_CLAUDE_BIN="$HOME/.local/bin/claude"
 if [[ -f "$SANDBOX_CLAUDE_BIN" ]]; then
-  _bin_owner=$(stat -c '%U' "$SANDBOX_CLAUDE_BIN" 2>/dev/null || echo "")
-  _bin_mode=$(stat -c '%a'  "$SANDBOX_CLAUDE_BIN" 2>/dev/null || echo "777")
-  if [[ "$_bin_owner" == "$(id -un)" && ! "$_bin_mode" =~ [2367][0-9][0-9] ]]; then
+  _claude_bind_src=$(realpath --canonicalize-existing "$SANDBOX_CLAUDE_BIN" 2>/dev/null || echo "$SANDBOX_CLAUDE_BIN")
+  _bin_owner=$(stat -c '%U' "$_claude_bind_src" 2>/dev/null || echo "")
+  _bin_mode=$(stat -c '%a'  "$_claude_bind_src" 2>/dev/null || echo "777")
+  _bin_mode_octal=$((8#$_bin_mode))
+  if [[ "$_bin_owner" == "$(id -un)" ]] && (( (_bin_mode_octal & 8#022) == 0 )); then
     BWRAP+=(
       --dir "$SANDBOX_HOME/.local"
       --dir "$SANDBOX_HOME/.local/bin"
-      --ro-bind "$SANDBOX_CLAUDE_BIN" "$SANDBOX_HOME/.local/bin/claude"
+      --ro-bind "$_claude_bind_src" "$SANDBOX_HOME/.local/bin/claude"
     )
   else
-    echo "⚠ Skipping ~/.local/bin/claude bind: not owned by current user or group/world-writable"
+    echo "⚠ Skipping ~/.local/bin/claude bind: target not owned by current user or group/world-writable ($_claude_bind_src, mode=$_bin_mode)"
   fi
 fi
 
@@ -1110,7 +1326,8 @@ oom_check() {
 # Launch sandbox
 # CRIT-3 fix: the bash -c script below is a static single-quoted string.
 # All runtime values are injected via --setenv above (_PROXY_SOCK, _PROXY_PORT,
-# _ISOLATE_NET, _LAUNCH_SHELL) and referenced as $VAR — never interpolated here.
+# _ISOLATE_NET, _LAUNCH_SHELL, _SHARE_SESSIONS) and referenced as $VAR — never
+# interpolated here.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Wall-clock timeout wrapper
@@ -1129,7 +1346,11 @@ else _rw_desc="read-write"; fi
 echo "▶ Launching sandbox (workdir: $WORKDIR [$_rw_desc], network: $NET_DESC)"
 echo "  Attach from another terminal: $0 --attach"
 echo "  Attach socket: $ATTACH_SOCK"
-echo "  Ctrl-C terminates the sandbox"
+if [[ "$LAUNCH_SHELL" == true ]]; then
+  echo "  Exit the sandbox shell with Ctrl-D or 'exit'"
+else
+  echo "  Ctrl-C terminates the sandbox"
+fi
 notify sandbox_start ":rocket: Sandbox started — workdir: \`$(basename "$WORKDIR")\` [$_rw_desc], network: $NET_DESC, PID: $$"
 
 SANDBOX_INIT_SCRIPT='
@@ -1142,7 +1363,17 @@ SANDBOX_INIT_SCRIPT='
 
   if [[ -d /run/host-claude ]]; then
     mkdir -p "$HOME/.claude"
-    cp --no-dereference --no-preserve=mode,ownership -r /run/host-claude/. "$HOME/.claude/"
+    if [[ "${_SHARE_SESSIONS:-}" == true ]]; then
+      # Session-managed paths are bind-mounted separately; exclude them from
+      # the host seed copy to avoid copying onto the same mounted files.
+      tar -C /run/host-claude \
+        --exclude='./projects' \
+        --exclude='./history.jsonl' \
+        --exclude='./settings.json' \
+        -cf - . | tar -C "$HOME/.claude" -xf -
+    else
+      cp --no-dereference --no-preserve=mode,ownership -r /run/host-claude/. "$HOME/.claude/"
+    fi
   fi
 
   if [[ -f /run/dummy-claude-credentials.json ]]; then
@@ -1224,7 +1455,7 @@ MCPEOF
 
   # Save _LAUNCH_SHELL before cleaning up internal init vars.
   _ls="$_LAUNCH_SHELL"
-  unset _PROXY_SOCK _PROXY_PORT _GITHUB_SOCK _GITHUB_PORT _ISOLATE_NET _ENABLE_GITHUB _LAUNCH_SHELL _ENABLE_GITHUB_MCP _MCP_SOCK _MCP_PORT
+  unset _PROXY_SOCK _PROXY_PORT _GITHUB_SOCK _GITHUB_PORT _ISOLATE_NET _ENABLE_GITHUB _LAUNCH_SHELL _SHARE_SESSIONS _ENABLE_GITHUB_MCP _MCP_SOCK _MCP_PORT
 
   if [[ "$_ls" == true ]]; then
     exec bash
@@ -1446,25 +1677,35 @@ snapshot_merge() {
   done
 }
 
-if [[ ${#RESOURCE_WRAPPER[@]} -gt 0 ]]; then
-  "${TIMEOUT_WRAPPER[@]+"${TIMEOUT_WRAPPER[@]}"}" "${RESOURCE_WRAPPER[@]}" "${BWRAP[@]}" -- bash -c "$SANDBOX_INIT_SCRIPT" -- "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}" &
+if [[ "$LAUNCH_SHELL" == true ]]; then
+  if [[ ${#RESOURCE_WRAPPER[@]} -gt 0 ]]; then
+    "${TIMEOUT_WRAPPER[@]+"${TIMEOUT_WRAPPER[@]}"}" "${RESOURCE_WRAPPER[@]}" "${BWRAP[@]}" -- bash -c "$SANDBOX_INIT_SCRIPT" -- "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}"
+  else
+    "${TIMEOUT_WRAPPER[@]+"${TIMEOUT_WRAPPER[@]}"}" "${BWRAP[@]}" -- bash -c "$SANDBOX_INIT_SCRIPT" -- "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}"
+  fi
+  SANDBOX_EXIT=$?
 else
-  "${TIMEOUT_WRAPPER[@]+"${TIMEOUT_WRAPPER[@]}"}" "${BWRAP[@]}" -- bash -c "$SANDBOX_INIT_SCRIPT" -- "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}" &
+  if [[ ${#RESOURCE_WRAPPER[@]} -gt 0 ]]; then
+    "${TIMEOUT_WRAPPER[@]+"${TIMEOUT_WRAPPER[@]}"}" "${RESOURCE_WRAPPER[@]}" "${BWRAP[@]}" -- bash -c "$SANDBOX_INIT_SCRIPT" -- "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}" &
+  else
+    "${TIMEOUT_WRAPPER[@]+"${TIMEOUT_WRAPPER[@]}"}" "${BWRAP[@]}" -- bash -c "$SANDBOX_INIT_SCRIPT" -- "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}" &
+  fi
+  SANDBOX_PID=$!
+  printf 'SANDBOX_PID=%q\n' "$SANDBOX_PID" >> "$METADATA_FILE"
+
+  forward_signal() {
+    local sig="$1"
+    kill "-$sig" "$SANDBOX_PID" 2>/dev/null || true
+    wait "$SANDBOX_PID" 2>/dev/null || true
+    cleanup
+  }
+
+  trap 'forward_signal INT' INT
+  trap 'forward_signal TERM' TERM
+
+  wait "$SANDBOX_PID" 2>/dev/null
+  SANDBOX_EXIT=$?
 fi
-SANDBOX_PID=$!
-
-forward_signal() {
-  local sig="$1"
-  kill "-$sig" "$SANDBOX_PID" 2>/dev/null || true
-  wait "$SANDBOX_PID" 2>/dev/null || true
-  cleanup
-}
-
-trap 'forward_signal INT' INT
-trap 'forward_signal TERM' TERM
-
-wait "$SANDBOX_PID" 2>/dev/null
-SANDBOX_EXIT=$?
 [[ ${#RESOURCE_WRAPPER[@]} -gt 0 ]] && oom_check "$SANDBOX_EXIT"
 timeout_check "$SANDBOX_EXIT"
 diff_on_exit

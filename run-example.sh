@@ -1,12 +1,45 @@
-# Basic shell (network isolated by default):
-./claudebox.sh --shell --workdir work
+#!/usr/bin/env bash
+set -euo pipefail
 
-# With GitHub MCP server (recommended):
-# Reads token from ~/.config/claudebox/gh-token automatically.
-# ./claudebox.sh --enable-github-mcp --workdir work
+usage() {
+  cat <<'EOF'
+Usage:
+  ./run-example.sh start
+  ./run-example.sh list
+  ./run-example.sh attach
+  ./run-example.sh attach ID
+  ./run-example.sh info ID
 
-# Or pass token explicitly:
-# GH_TOKEN=$(cat ~/.config/claudebox/gh-token) ./claudebox.sh --enable-github-mcp --workdir work
+Commands:
+  start   Launch the example sandbox shell with session sharing and GitHub MCP.
+  list    Show current sandboxes with workspace and status info.
+  attach  Reconnect to a running sandbox shell via claudebox --attach.
+  info    Show detailed info for one running or stale sandbox.
+EOF
+}
 
-# With GitHub CONNECT proxy (unrecommended — exposes token in sandbox):
-# ./claudebox.sh --enable-github --workdir work
+case "${1:-start}" in
+  start)
+    exec ./claudebox.sh --bind-binaries --shell --share-claude-dir --share-sessions --enable-github-mcp --workdir work
+    ;;
+  list)
+    exec ./claudebox.sh --list
+    ;;
+  attach)
+    if [[ $# -gt 1 ]]; then
+      exec ./claudebox.sh --attach "$2"
+    fi
+    exec ./claudebox.sh --attach
+    ;;
+  info)
+    [[ $# -ge 2 ]] || { usage >&2; exit 1; }
+    exec ./claudebox.sh --info "$2"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 1
+    ;;
+esac
