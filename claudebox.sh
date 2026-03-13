@@ -644,6 +644,7 @@ cleanup() {
   rm -f "$METADATA_FILE" 2>/dev/null || true
   rm -rf "$ATTACH_DIR" 2>/dev/null || true
   [[ -n "$TEMP_CREDS" && -f "$TEMP_CREDS" && -z "$DUMMY_CREDS_FILE" ]] && rm -f "$TEMP_CREDS" || true
+  [[ -n "${SANDBOX_GITCONFIG:-}" && -f "$SANDBOX_GITCONFIG" ]] && rm -f "$SANDBOX_GITCONFIG" || true
   # HIGH-4: clean up private temp dir if we created it
   [[ "${_SOCK_DIR_CREATED:-}" == true ]] && rm -rf "$_SOCK_DIR" 2>/dev/null || true
   # MED-7: snapshot staging handling depends on phase:
@@ -787,6 +788,12 @@ fs.writeFileSync(dest, JSON.stringify(creds, null, 2));
 NODEEOF
   echo "✔ Dummy credentials ready (auto-generated)"
 fi
+
+# MED-6: create a read-only gitconfig that disables hooks (sandbox cannot override)
+_GITCONFIG_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+SANDBOX_GITCONFIG=$(mktemp "$_GITCONFIG_DIR/claudebox-gitconfig-XXXXXX")
+printf '[core]\n\thooksPath = /dev/null\n' > "$SANDBOX_GITCONFIG"
+chmod 444 "$SANDBOX_GITCONFIG"
 
 # ---------------------------------------------------------------------------
 # Start credential proxy on the host
@@ -1026,11 +1033,10 @@ BWRAP=(
   --setenv HTTP_PROXY  ""
   --setenv ALL_PROXY   ""
   --setenv NO_PROXY    "127.0.0.1,localhost,::1"
-  # MED-6: disable git hooks to prevent network isolation bypass via
-  # hook scripts in writable workdirs (e.g. post-checkout, pre-push).
-  --setenv GIT_CONFIG_VALUE_0 "/dev/null"
-  --setenv GIT_CONFIG_KEY_0  "core.hooksPath"
-  --setenv GIT_CONFIG_COUNT  "1"
+  # MED-6: disable git hooks via read-only system gitconfig to prevent
+  # network isolation bypass.  Env vars (GIT_CONFIG_COUNT) are bypassable
+  # by sandbox code; a ro-bind gitconfig file cannot be overridden.
+  --ro-bind "$SANDBOX_GITCONFIG" /etc/gitconfig
 
   # CRIT-3: pass init-script control values via --setenv so the bash -c script
   # below contains NO interpolation of user-controlled strings.

@@ -70,11 +70,16 @@ const MAX_CONNECTIONS = 100;
 // MCP proxy path allowlist — only /mcp and /sse endpoints.
 const MCP_PATH_ALLOWLIST = /^\/(mcp|sse)(\/|$)/;
 
-// Private/reserved IP check — covers all RFC 1918, loopback, link-local,
-// carrier-grade NAT (100.64/10), benchmarking (198.18/15), and IPv6 ULA/link-local.
+// Private/reserved IP check — covers RFC 1918, loopback, link-local,
+// CGNAT (100.64/10), benchmarking (198.18/15), class E (240/4),
+// broadcast, and IPv6 ULA/link-local/loopback (including expanded forms).
 function isPrivateIP(addr) {
-  const ip = addr.replace(/^::ffff:/i, '');
-  return /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|0\.|100\.(6[4-9]|[7-9]\d|1[0-2][0-7])\.|198\.1[89]\.|::1$|fe80|fc|fd)/.test(ip);
+  // Strip IPv4-mapped and SIIT-translated IPv6 prefixes
+  const ip = addr.replace(/^::ffff:(0+:)?/i, '');
+  if (ip === '255.255.255.255') return true;
+  // Normalize expanded IPv6 loopback (0000:...:0001) to ::1 for matching
+  const collapsed = ip.replace(/^0{1,4}(:0{1,4}){6}:0{0,3}1$/, '::1');
+  return /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|0\.|100\.(6[4-9]|[7-9]\d|1[0-2][0-7])\.|198\.1[89]\.|240\.|::1$|fe80|fc|fd)/.test(collapsed);
 }
 
 // ---------------------------------------------------------------------------
@@ -705,6 +710,7 @@ function startMcpAuthProxy(targetPort, socketPath, bearerToken) {
       // to prevent the sandbox from injecting trusted headers into the MCP server.
       const mcpDropHeaders = new Set([
         'connection', 'keep-alive', 'content-length', 'host',
+        'authorization', 'x-api-key', 'cookie',
         'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto',
         'x-real-ip', 'cf-connecting-ip', 'true-client-ip',
       ]);
