@@ -70,6 +70,13 @@ const MAX_CONNECTIONS = 100;
 // MCP proxy path allowlist — only /mcp and /sse endpoints.
 const MCP_PATH_ALLOWLIST = /^\/(mcp|sse)(\/|$)/;
 
+// Private/reserved IP check — covers all RFC 1918, loopback, link-local,
+// carrier-grade NAT (100.64/10), benchmarking (198.18/15), and IPv6 ULA/link-local.
+function isPrivateIP(addr) {
+  const ip = addr.replace(/^::ffff:/i, '');
+  return /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|0\.|100\.(6[4-9]|[7-9]\d|1[0-2][0-7])\.|198\.1[89]\.|::1$|fe80|fc|fd)/.test(ip);
+}
+
 // ---------------------------------------------------------------------------
 // Argument parsing
 // ---------------------------------------------------------------------------
@@ -352,16 +359,14 @@ function sendNotification(event, message, notifyCommand, notifyWebhook) {
     // MED-2: resolve hostname and reject private/internal IPs to prevent
     // DNS rebinding SSRF (checking hostname alone is insufficient).
     const host = u.hostname;
-    if (host === 'localhost' || host === '::1' ||
-        host.startsWith('[::1]') || host.startsWith('[fc') || host.startsWith('[fd')) {
+    if (host === 'localhost' || isPrivateIP(host)) {
       console.warn(`[notify] webhook rejected: private/internal address (${host})`);
       return;
     }
     const dns = require('dns');
     dns.lookup(host, (err, address) => {
       if (err) { console.warn(`[notify] webhook DNS lookup failed: ${err.message}`); return; }
-      const unmapped = address.replace(/^::ffff:/i, '');
-      if (/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|0\.|::1|fc|fd)/.test(unmapped)) {
+      if (isPrivateIP(address)) {
         console.warn(`[notify] webhook rejected: ${host} resolved to private address ${address}`);
         return;
       }
@@ -696,14 +701,24 @@ function startMcpAuthProxy(targetPort, socketPath, bearerToken) {
         return;
       }
 
+      // SEC: filter request headers — drop hop-by-hop and sensitive headers
+      // to prevent the sandbox from injecting trusted headers into the MCP server.
+      const mcpDropHeaders = new Set([
+        'connection', 'keep-alive', 'content-length', 'host',
+        'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto',
+        'x-real-ip', 'cf-connecting-ip', 'true-client-ip',
+      ]);
+      const mcpHeaders = { authorization: `Bearer ${bearerToken}` };
+      for (const [k, v] of Object.entries(req.headers)) {
+        if (!mcpDropHeaders.has(k.toLowerCase())) mcpHeaders[k] = v;
+      }
       const opts = {
         hostname: '127.0.0.1',
         port: targetPort,
         path: normPath + parsed.search,
         method: req.method,
-        headers: { ...req.headers, authorization: `Bearer ${bearerToken}` },
+        headers: mcpHeaders,
       };
-      delete opts.headers.host;
       if (body.length) opts.headers['content-length'] = String(body.length);
 
       const upstream = http.request(opts, (upRes) => {
@@ -809,13 +824,13 @@ function makeConnectHandler(allowlist, verbose) {
           client.end('HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n');
           return;
         }
-        // Reject private/loopback/link-local IPs (incl. IPv4-mapped IPv6 like ::ffff:127.0.0.1)
-        const unmapped = address.replace(/^::ffff:/i, '');
-        if (/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|0\.|::1|fc|fd)/.test(unmapped)) {
+        // Reject private/loopback/link-local/CGNAT IPs (incl. IPv4-mapped IPv6)
+        if (isPrivateIP(address)) {
           console.warn(`[github-connect] DNS rebinding blocked: ${host} resolved to ${address}`);
           client.end('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n');
           return;
         }
+        const unmapped = address.replace(/^::ffff:/i, '');
 
       const upstream = net.createConnection(targetPort, unmapped, () => {
         client.write('HTTP/1.1 200 Connection Established\r\n\r\n');

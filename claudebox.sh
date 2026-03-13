@@ -157,11 +157,11 @@ while [[ $# -gt 0 ]]; do
     --workdir)           WORKDIR=$2; shift 2 ;;
     --sandbox-home)      SANDBOX_HOME_SEED=$2; shift 2 ;;
     --enable-github)
-      echo "⚠ --enable-github is DEPRECATED: real GH_TOKEN enters the sandbox."
-      echo "  Use --enable-github-mcp instead (token stays on host)."
-      ENABLE_GITHUB=true; shift ;;
+      echo "❌ --enable-github has been removed (real token was leaked into sandbox)."
+      echo "   Use --enable-github-mcp instead (recommended, token stays on host)."
+      exit 1 ;;
     --auto-refresh-auth) AUTO_REFRESH_AUTH=true; shift ;;
-    --disable-github)    ENABLE_GITHUB=false; shift ;;
+    --disable-github)    shift ;;  # no-op (--enable-github removed)
     --gh-token-file)     GH_TOKEN_FILE=$2; shift 2 ;;
     --enable-github-mcp) ENABLE_GITHUB_MCP=true; shift ;;
     --mcp-port)
@@ -197,7 +197,7 @@ while [[ $# -gt 0 ]]; do
       # MED-2: runtime DNS resolution check is done in credential-proxy.js to
       # catch rebinding; this is a fast pre-flight for known-bad literals.
       _wh_host=$(echo "$2" | sed -n 's|^https://\([^/:]*\).*|\1|p')
-      if [[ "$_wh_host" =~ ^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|0\.|localhost$|\[::1\]|\[fc|\[fd) ]]; then
+      if [[ "$_wh_host" =~ ^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|0\.|100\.(6[4-9]|[7-9][0-9]|1[0-2][0-7])\.|198\.1[89]\.|localhost$|\[::1\]|\[fc|\[fd|\[fe80) ]]; then
         echo "❌ --notify-webhook: private/internal addresses not allowed"; exit 1
       fi
       NOTIFY_WEBHOOK=$2; shift 2 ;;
@@ -261,8 +261,8 @@ OPTIONS:
   --sandbox-home DIR     Copy files from DIR into the sandbox home at startup.
   --enable-github-mcp    Enable GitHub access via MCP server (recommended; requires GH_TOKEN
                          and github-mcp-server binary on host).
-  --enable-github        Enable GitHub access via CONNECT proxy + gh CLI (unrecommended;
-                         use --enable-github-mcp instead). Requires GH_TOKEN on host.
+  --enable-github        REMOVED — leaked real token into sandbox.
+                         Use --enable-github-mcp instead.
   --auto-refresh-auth   On 401 responses, run a short host `claude -p ...` probe to let
                         Claude refresh OAuth tokens, then retry once if the token changed.
   --gh-token-file FILE   Read GitHub PAT from FILE (default: ~/.config/claudebox/gh-token).
@@ -347,6 +347,9 @@ shell_join() {
 
 # SEC: safe metadata loader — only accepts VAR=VALUE lines (no command execution).
 # Replaces `source` to prevent arbitrary code execution from crafted metadata files.
+# Only whitelisted variable names are accepted to prevent overwriting critical vars.
+_METADATA_ALLOWED_KEYS="SANDBOX_ID WORKDIR_PATH WORKSPACE_NAME STARTED_AT ATTACH_SOCKET SANDBOX_PID LAUNCH_MODE NETWORK_MODE SHARE_SESSIONS_MODE SHARE_CLAUDE_DIR_MODE BIND_BINARIES_MODE ENABLE_GITHUB_MCP_MODE ENABLE_GITHUB_MODE READONLY_WORKDIR_MODE SNAPSHOT_MODE IMAGE_ROOT PORT_ANTHROPIC_META PORT_GITHUB_META PORT_MCP_META HOST_PORT_ANTHROPIC_META HOST_PORT_GITHUB_META HOST_PORT_MCP_SERVER_META CLAUDEBOX_ARGS_SHELL CLAUDE_ARGS_SHELL"
+
 load_metadata() {
   local file="$1" line key val
   [[ -f "$file" ]] || return 1
@@ -357,6 +360,11 @@ load_metadata() {
     if [[ "$line" =~ ^([A-Za-z_][A-Za-z_0-9]*)=(.*)$ ]]; then
       key="${BASH_REMATCH[1]}"
       val="${BASH_REMATCH[2]}"
+      # Reject keys not in the whitelist to prevent overwriting PATH, BWRAP, etc.
+      case " $_METADATA_ALLOWED_KEYS " in
+        *" $key "*) ;;
+        *) continue ;;
+      esac
       # Remove one layer of shell quoting produced by printf '%q':
       #   $'...' quoting, '...' quoting, or backslash escapes (\  → space etc.)
       if [[ "$val" =~ ^\$\'(.*)\'$ ]]; then
@@ -1062,15 +1070,13 @@ else
   BWRAP+=(--bind "$WORKDIR" "$SANDBOX_WORKDIR")
 fi
 
-# GitHub: real GH_TOKEN passed directly (TLS tunnel prevents proxy injection).
-# HTTPS_PROXY routes gh CLI through the CONNECT proxy (allowlist enforced there).
+# --enable-github is REMOVED: it injected real GH_TOKEN into the sandbox,
+# allowing any sandboxed code to exfiltrate the credential.
+# Use --enable-github-mcp instead (token stays on host, MCP proxy injects it).
 if [[ "$ENABLE_GITHUB" == true ]]; then
-  [[ -n "${GH_TOKEN:-}" ]] || { echo "❌ --enable-github requires GH_TOKEN to be set on the host"; exit 1; }
-  BWRAP+=(
-    --setenv GH_TOKEN     "$GH_TOKEN"
-    --setenv GITHUB_TOKEN "$GH_TOKEN"
-    --setenv HTTPS_PROXY  "http://127.0.0.1:$PORT_GITHUB_CONNECT"
-  )
+  echo "❌ --enable-github has been removed (real token was leaked into sandbox)."
+  echo "   Use --enable-github-mcp instead (recommended, token stays on host)."
+  exit 1
 fi
 
 # Set HTTPS_PROXY when --allowlist-url is used (even without --enable-github)
