@@ -37,11 +37,14 @@ const { spawnSync, spawn } = require('child_process');
 // ---------------------------------------------------------------------------
 // Dummy token placed in the sandbox by claudebox.sh.
 // The proxy replaces it with the real token before forwarding.
-// HIGH-4: per-session random token from SESSION_DUMMY_TOKEN env; falls back to
-// a fixed value only for manual/standalone proxy usage.
+// HIGH-4: per-session random token from SESSION_DUMMY_TOKEN env.
+// MED-5: no static fallback — require the env var to be set.
 // ---------------------------------------------------------------------------
-const DUMMY_CLAUDE_TOKEN = process.env.SESSION_DUMMY_TOKEN ||
-  'sk-ant-oat01-dummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDummyDQ-DummyAA';
+const DUMMY_CLAUDE_TOKEN = process.env.SESSION_DUMMY_TOKEN || '';
+if (!DUMMY_CLAUDE_TOKEN && !process.argv.includes('--bridge-only')) {
+  console.error('[FATAL] SESSION_DUMMY_TOKEN environment variable is required');
+  process.exit(1);
+}
 
 const DEFAULT_ANTHROPIC_SOCKET    = '/tmp/claude-proxy-anthropic.sock';
 const DEFAULT_ANTHROPIC_PORT      = 58080;
@@ -246,6 +249,22 @@ function getTokenSummary() {
   return { input: _totalInputTokens, output: _totalOutputTokens, total: getTotalTokens(), requests: _totalRequests };
 }
 
+function trackUsage(usage, verbose) {
+  addTokenUsage(usage.input_tokens, usage.output_tokens);
+  if (verbose) {
+    const s = getTokenSummary();
+    console.log(`[tokens] +${usage.input_tokens || 0}in +${usage.output_tokens || 0}out (total: ${s.total})`);
+  }
+  if (_forward_tokenLimit > 0 && getTotalTokens() >= _forward_tokenLimit && !_tokenLimitExceeded) {
+    _tokenLimitExceeded = true;
+    const s = getTokenSummary();
+    const msg = `:money_with_wings: Token budget exceeded: ${s.total} tokens used (limit: ${_forward_tokenLimit}). New requests will be rejected.`;
+    console.warn(`[tokens] ⚠ Token budget exceeded: ${s.total} (limit: ${_forward_tokenLimit})`);
+    sendNotification('token_limit', msg, _forward_notifyCommand, _forward_notifyWebhook);
+    auditLog({ event: 'token_limit_exceeded', ...s, limit: _forward_tokenLimit });
+  }
+}
+
 function parseJsonSafe(text) {
   try { return JSON.parse(text); } catch (_) { return null; }
 }
@@ -330,22 +349,31 @@ function sendNotification(event, message, notifyCommand, notifyWebhook) {
       console.warn(`[notify] webhook rejected: only https allowed (got ${u.protocol})`);
       return;
     }
-    // SEC: reject private/internal IPs to prevent SSRF
+    // MED-2: resolve hostname and reject private/internal IPs to prevent
+    // DNS rebinding SSRF (checking hostname alone is insufficient).
     const host = u.hostname;
-    if (/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|0\.)/.test(host) ||
-        host === 'localhost' || host === '::1' || host.startsWith('fc') || host.startsWith('fd') ||
+    if (host === 'localhost' || host === '::1' ||
         host.startsWith('[::1]') || host.startsWith('[fc') || host.startsWith('[fd')) {
       console.warn(`[notify] webhook rejected: private/internal address (${host})`);
       return;
     }
-    const reqOpts = {
-      hostname: u.hostname, port: u.port || 443, path: u.pathname + u.search,
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
-    };
-    const mod = u.protocol === 'https:' ? https : http;
-    const req = mod.request(reqOpts, (res) => res.resume());
-    req.on('error', () => {});
-    req.end(payload);
+    const dns = require('dns');
+    dns.lookup(host, (err, address) => {
+      if (err) { console.warn(`[notify] webhook DNS lookup failed: ${err.message}`); return; }
+      const unmapped = address.replace(/^::ffff:/i, '');
+      if (/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|0\.|::1|fc|fd)/.test(unmapped)) {
+        console.warn(`[notify] webhook rejected: ${host} resolved to private address ${address}`);
+        return;
+      }
+      const reqOpts = {
+        hostname: address, port: u.port || 443, path: u.pathname + u.search,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), 'Host': u.host },
+      };
+      const req = https.request(reqOpts, (r) => r.resume());
+      req.on('error', () => {});
+      req.end(payload);
+    });
   }
 }
 
@@ -414,98 +442,97 @@ function forward(method, urlPath, headers, body, res, verbose, onRetry) {
     const respHeaders = filterResponseHeaders(upstream.headers);
     const isStreaming = (upstream.headers['content-type'] || '').includes('text/event-stream');
 
-    // Token tracking: intercept response to extract usage data.
-    // For non-streaming: buffer full body, parse JSON, extract usage.
-    // For streaming: watch for message_delta events with usage in SSE stream.
-    const respChunks = [];
-    let respLen = 0;
-    let respAborted = false;
-    upstream.on('data', (chunk) => {
-      if (respAborted) return;
-      respLen += chunk.length;
-      // SEC: prevent host OOM from very large API responses
-      if (respLen > MAX_RESPONSE_SIZE) {
-        respAborted = true;
-        upstream.destroy();
-        if (!res.headersSent) { res.writeHead(502); res.end('Response too large'); }
-        return;
-      }
-      respChunks.push(chunk);
-    });
-    upstream.on('end', () => {
-      if (respAborted) return;
-      const respBody = Buffer.concat(respChunks);
-      const durationMs = Date.now() - reqStartTime;
-      const respText = isStreaming ? '' : respBody.toString('utf8');
-
-      if (upstream.statusCode === 401 && onRetry) {
-        if (_forward_autoRefreshAuth && isExpiredOauthResponse(upstream.statusCode, respText)) {
-          refreshHostAuth(verbose).then((ok) => {
-            if (!ok) {
-              if (!res.headersSent) res.writeHead(upstream.statusCode, respHeaders);
-              res.end(respBody);
-              return;
-            }
-            invalidateCache();
-            setImmediate(onRetry);
-          });
-          return;
-        }
-        if (!res.headersSent) res.writeHead(upstream.statusCode, respHeaders);
-        res.end(respBody);
-        return;
-      }
-
-      // Extract usage from response
-      let usage = null;
-      try {
-        if (isStreaming) {
-          // SSE: find last "data: {...}" line containing "usage"
-          const text = respBody.toString('utf8');
-          const lines = text.split('\n').filter(l => l.startsWith('data: ') && l.includes('"usage"'));
+    // MED-1: streaming responses are piped directly to the client to avoid
+    // buffering the entire body in memory.  Non-streaming and error responses
+    // are still buffered for 401 retry and usage extraction.
+    if (isStreaming && upstream.statusCode === 200) {
+      // Stream directly — keep a small rolling tail buffer for usage extraction.
+      if (!res.headersSent) res.writeHead(upstream.statusCode, respHeaders);
+      const TAIL_SIZE = 8192;
+      let tail = '';
+      upstream.on('data', (chunk) => {
+        res.write(chunk);
+        // Keep last TAIL_SIZE chars for usage parsing
+        tail += chunk.toString('utf8');
+        if (tail.length > TAIL_SIZE * 2) tail = tail.slice(-TAIL_SIZE);
+      });
+      upstream.on('end', () => {
+        const durationMs = Date.now() - reqStartTime;
+        let usage = null;
+        try {
+          const lines = tail.split('\n').filter(l => l.startsWith('data: ') && l.includes('"usage"'));
           if (lines.length > 0) {
             const lastData = JSON.parse(lines[lines.length - 1].slice(6));
             usage = lastData.usage || (lastData.message && lastData.message.usage) || null;
           }
-        } else if (upstream.statusCode === 200) {
-          const json = JSON.parse(respText);
-          usage = json.usage || null;
-        }
-      } catch (e) { /* parse failure — skip usage tracking */ }
-
-      if (usage) {
-        addTokenUsage(usage.input_tokens, usage.output_tokens);
-        if (verbose) {
-          const s = getTokenSummary();
-          console.log(`[tokens] +${usage.input_tokens || 0}in +${usage.output_tokens || 0}out (total: ${s.total})`);
-        }
-        // Check token budget after accumulating
-        if (_forward_tokenLimit > 0 && getTotalTokens() >= _forward_tokenLimit && !_tokenLimitExceeded) {
-          _tokenLimitExceeded = true;
-          const s = getTokenSummary();
-          const msg = `:money_with_wings: Token budget exceeded: ${s.total} tokens used (limit: ${_forward_tokenLimit}). New requests will be rejected.`;
-          console.warn(`[tokens] ⚠ Token budget exceeded: ${s.total} (limit: ${_forward_tokenLimit})`);
-          sendNotification('token_limit', msg, _forward_notifyCommand, _forward_notifyWebhook);
-          auditLog({ event: 'token_limit_exceeded', ...s, limit: _forward_tokenLimit });
-        }
-      }
-
-      // Audit log entry
-      auditLog({
-        event: 'api_request',
-        method, path: urlPath, status: upstream.statusCode,
-        duration_ms: durationMs,
-        input_tokens: usage ? usage.input_tokens : null,
-        output_tokens: usage ? usage.output_tokens : null,
-        cumulative_tokens: getTotalTokens(),
+        } catch (_) {}
+        if (usage) trackUsage(usage, verbose);
+        auditLog({ event: 'api_request', method, path: urlPath, status: upstream.statusCode,
+          duration_ms: durationMs,
+          input_tokens: usage ? usage.input_tokens : null,
+          output_tokens: usage ? usage.output_tokens : null,
+          cumulative_tokens: getTotalTokens() });
+        res.end();
       });
+    } else {
+      // Non-streaming / error: buffer for retry + usage extraction.
+      const respChunks = [];
+      let respLen = 0;
+      let respAborted = false;
+      upstream.on('data', (chunk) => {
+        if (respAborted) return;
+        respLen += chunk.length;
+        if (respLen > MAX_RESPONSE_SIZE) {
+          respAborted = true;
+          upstream.destroy();
+          if (!res.headersSent) { res.writeHead(502); res.end('Response too large'); }
+          return;
+        }
+        respChunks.push(chunk);
+      });
+      upstream.on('end', () => {
+        if (respAborted) return;
+        const respBody = Buffer.concat(respChunks);
+        const durationMs = Date.now() - reqStartTime;
+        const respText = respBody.toString('utf8');
 
-      // Send response to client
-      if (!res.headersSent) {
-        res.writeHead(upstream.statusCode, respHeaders);
-      }
-      res.end(respBody);
-    });
+        if (upstream.statusCode === 401 && onRetry) {
+          if (_forward_autoRefreshAuth && isExpiredOauthResponse(upstream.statusCode, respText)) {
+            refreshHostAuth(verbose).then((ok) => {
+              if (!ok) {
+                if (!res.headersSent) res.writeHead(upstream.statusCode, respHeaders);
+                res.end(respBody);
+                return;
+              }
+              invalidateCache();
+              setImmediate(onRetry);
+            });
+            return;
+          }
+          if (!res.headersSent) res.writeHead(upstream.statusCode, respHeaders);
+          res.end(respBody);
+          return;
+        }
+
+        let usage = null;
+        try {
+          if (upstream.statusCode === 200) {
+            const json = JSON.parse(respText);
+            usage = json.usage || null;
+          }
+        } catch (_) {}
+        if (usage) trackUsage(usage, verbose);
+
+        auditLog({ event: 'api_request', method, path: urlPath, status: upstream.statusCode,
+          duration_ms: durationMs,
+          input_tokens: usage ? usage.input_tokens : null,
+          output_tokens: usage ? usage.output_tokens : null,
+          cumulative_tokens: getTotalTokens() });
+
+        if (!res.headersSent) res.writeHead(upstream.statusCode, respHeaders);
+        res.end(respBody);
+      });
+    }
   });
 
   req.on('error', (err) => {
@@ -537,8 +564,11 @@ function createHandler(verbose, tokenLimit, notifyCommand, notifyWebhook) {
       return;
     }
 
-    // Token budget: reject new requests if limit exceeded
-    if (tokenLimit > 0 && _tokenLimitExceeded) {
+    // MED-3: Token budget — reject new requests if limit exceeded.
+    // Check both the accumulated flag and current total to handle races
+    // where parallel requests finish between check and accumulation.
+    if (tokenLimit > 0 && (_tokenLimitExceeded || getTotalTokens() >= tokenLimit)) {
+      _tokenLimitExceeded = true;
       res.writeHead(429, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'Token budget exceeded', total_tokens: getTotalTokens(), limit: tokenLimit }));
       auditLog({ event: 'token_limit_rejected', path: normalizedPath, total: getTotalTokens(), limit: tokenLimit });
@@ -655,6 +685,17 @@ function startMcpAuthProxy(targetPort, socketPath, bearerToken) {
     req.on('end', () => {
       if (aborted) return;
       const body = Buffer.concat(chunks);
+
+      // SEC: require dummy token from sandbox (same gating as Anthropic proxy).
+      // Reject requests that don't present the session dummy token.
+      const authHeader = req.headers['authorization'] || req.headers['x-api-key'] || '';
+      const bareToken = /^Bearer /i.test(authHeader) ? authHeader.slice(7) : authHeader;
+      if (!bareToken || bareToken !== DUMMY_CLAUDE_TOKEN) {
+        res.writeHead(401);
+        res.end('Authentication required');
+        return;
+      }
+
       const opts = {
         hostname: '127.0.0.1',
         port: targetPort,
@@ -673,7 +714,18 @@ function startMcpAuthProxy(targetPort, socketPath, bearerToken) {
           if (!dropHeaders.has(k.toLowerCase())) safeHeaders[k] = v;
         }
         res.writeHead(upRes.statusCode, safeHeaders);
-        upRes.pipe(res);
+        // MED-4: enforce response size limit to prevent OOM from MCP server
+        let mcpRespLen = 0;
+        upRes.on('data', (chunk) => {
+          mcpRespLen += chunk.length;
+          if (mcpRespLen > MAX_RESPONSE_SIZE) {
+            upRes.destroy();
+            res.end();
+            return;
+          }
+          res.write(chunk);
+        });
+        upRes.on('end', () => res.end());
       });
       upstream.on('error', (err) => {
         console.error(`${tag} upstream error:`, err.message);
@@ -757,14 +809,15 @@ function makeConnectHandler(allowlist, verbose) {
           client.end('HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n');
           return;
         }
-        // Reject private/loopback/link-local IPs
-        if (/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|0\.|::1|fc|fd)/.test(address)) {
+        // Reject private/loopback/link-local IPs (incl. IPv4-mapped IPv6 like ::ffff:127.0.0.1)
+        const unmapped = address.replace(/^::ffff:/i, '');
+        if (/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|0\.|::1|fc|fd)/.test(unmapped)) {
           console.warn(`[github-connect] DNS rebinding blocked: ${host} resolved to ${address}`);
           client.end('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n');
           return;
         }
 
-      const upstream = net.createConnection(targetPort, address, () => {
+      const upstream = net.createConnection(targetPort, unmapped, () => {
         client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
         if (afterHeader.length) upstream.write(afterHeader);
         client.pipe(upstream);

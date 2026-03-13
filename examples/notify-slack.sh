@@ -27,17 +27,18 @@ case "${CLAUDEBOX_EVENT:-unknown}" in
   *)             color="#808080" ;;  # grey
 esac
 
-payload=$(cat <<ENDJSON
-{
-  "attachments": [{
-    "color": "$color",
-    "text": "${CLAUDEBOX_MESSAGE:-No message}",
-    "footer": "claudebox | PID ${CLAUDEBOX_PID:-?} | $(date -Iseconds)",
-    "fallback": "${CLAUDEBOX_MESSAGE:-No message}"
-  }]
-}
-ENDJSON
-)
+# MED-8: use jq for safe JSON construction to prevent injection via
+# CLAUDEBOX_MESSAGE or other env vars containing quotes/special chars.
+if ! command -v jq >/dev/null 2>&1; then
+  echo "notify-slack.sh: jq is required but not installed" >&2
+  exit 1
+fi
+
+payload=$(jq -n \
+  --arg color "$color" \
+  --arg text "${CLAUDEBOX_MESSAGE:-No message}" \
+  --arg footer "claudebox | PID ${CLAUDEBOX_PID:-?} | $(date -Iseconds)" \
+  '{attachments: [{color: $color, text: $text, footer: $footer, fallback: $text}]}')
 
 curl -s -X POST -H 'Content-Type: application/json' \
   -d "$payload" "$SLACK_WEBHOOK_URL" >/dev/null

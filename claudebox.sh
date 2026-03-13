@@ -193,7 +193,9 @@ while [[ $# -gt 0 ]]; do
     --notify-webhook)
       # MED-1: only allow https webhooks to prevent SSRF to internal services.
       [[ "$2" =~ ^https:// ]] || { echo "❌ --notify-webhook: only https:// URLs allowed"; exit 1; }
-      # SEC: reject private/internal addresses to prevent SSRF
+      # SEC: reject obviously private/internal hostnames.
+      # MED-2: runtime DNS resolution check is done in credential-proxy.js to
+      # catch rebinding; this is a fast pre-flight for known-bad literals.
       _wh_host=$(echo "$2" | sed -n 's|^https://\([^/:]*\).*|\1|p')
       if [[ "$_wh_host" =~ ^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|0\.|localhost$|\[::1\]|\[fc|\[fd) ]]; then
         echo "❌ --notify-webhook: private/internal addresses not allowed"; exit 1
@@ -343,6 +345,46 @@ shell_join() {
   printf '%s' "$out"
 }
 
+# SEC: safe metadata loader — only accepts VAR=VALUE lines (no command execution).
+# Replaces `source` to prevent arbitrary code execution from crafted metadata files.
+load_metadata() {
+  local file="$1" line key val
+  [[ -f "$file" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Skip blank lines and comments
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    # Only accept lines matching KEY=VALUE (KEY is a valid bash identifier)
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z_0-9]*)=(.*)$ ]]; then
+      key="${BASH_REMATCH[1]}"
+      val="${BASH_REMATCH[2]}"
+      # Remove one layer of shell quoting produced by printf '%q':
+      #   $'...' quoting, '...' quoting, or backslash escapes (\  → space etc.)
+      if [[ "$val" =~ ^\$\'(.*)\'$ ]]; then
+        val="${BASH_REMATCH[1]}"
+        val="${val//\\\'/\'}"
+        val="${val//\\\\/\\}"
+      elif [[ "$val" =~ ^\'(.*)\'$ ]]; then
+        val="${BASH_REMATCH[1]}"
+      else
+        # Backslash-escaped characters (e.g. path\ with\ spaces)
+        local unesc="" i=0 ch
+        while (( i < ${#val} )); do
+          ch="${val:i:1}"
+          if [[ "$ch" == "\\" && $(( i + 1 )) -lt ${#val} ]]; then
+            i=$(( i + 1 ))
+            unesc+="${val:i:1}"
+          else
+            unesc+="$ch"
+          fi
+          i=$(( i + 1 ))
+        done
+        val="$unesc"
+      fi
+      printf -v "$key" '%s' "$val"
+    fi
+  done < "$file"
+}
+
 allocate_free_port() {
   node -e '
 const net = require("net");
@@ -362,8 +404,7 @@ allocate_sandbox_id() {
   for _meta in "$_SOCK_DIR"/claudebox-attach-*/metadata.env; do
     [[ -f "$_meta" ]] || continue
     unset SANDBOX_ID
-    # shellcheck disable=SC1090
-    source "$_meta"
+    load_metadata "$_meta"
     [[ "${SANDBOX_ID:-}" =~ ^[0-9]+$ ]] || continue
     used["$SANDBOX_ID"]=1
   done
@@ -380,8 +421,7 @@ find_sandbox_metadata() {
     latest="$_meta"
     if [[ -n "$target" ]]; then
       unset SANDBOX_ID ATTACH_SOCKET
-      # shellcheck disable=SC1090
-      source "$_meta"
+      load_metadata "$_meta"
       if [[ "${SANDBOX_ID:-}" == "$target" || "${ATTACH_SOCKET:-}" == "$target" ]]; then
         found="$_meta"
       fi
@@ -400,8 +440,7 @@ print_sandbox_list() {
   for _meta in "$_SOCK_DIR"/claudebox-attach-*/metadata.env; do
     [[ -f "$_meta" ]] || continue
     unset SANDBOX_ID WORKDIR_PATH WORKSPACE_NAME STARTED_AT ATTACH_SOCKET SANDBOX_PID LAUNCH_MODE NETWORK_MODE
-    # shellcheck disable=SC1090
-    source "$_meta"
+    load_metadata "$_meta"
     count=$((count + 1))
     _status="stopped"
     if [[ -n "${ATTACH_SOCKET:-}" && -S "${ATTACH_SOCKET:-}" ]]; then
@@ -431,8 +470,7 @@ print_sandbox_info() {
   unset READONLY_WORKDIR_MODE SNAPSHOT_MODE IMAGE_ROOT PORT_ANTHROPIC_META PORT_GITHUB_META PORT_MCP_META
   unset HOST_PORT_ANTHROPIC_META HOST_PORT_GITHUB_META HOST_PORT_MCP_SERVER_META
   unset CLAUDE_ARGS_SHELL CLAUDEBOX_ARGS_SHELL
-  # shellcheck disable=SC1090
-  source "$meta"
+  load_metadata "$meta"
   _status="stopped"
   if [[ -n "${ATTACH_SOCKET:-}" && -S "${ATTACH_SOCKET:-}" ]]; then
     _status="running"
@@ -487,8 +525,7 @@ if [[ "$ATTACH_MODE" == true ]]; then
     exit 1
   }
   unset ATTACH_SOCKET SANDBOX_ID WORKSPACE_NAME
-  # shellcheck disable=SC1090
-  source "$_attach_meta"
+  load_metadata "$_attach_meta"
   _found_sock="${ATTACH_SOCKET:-}"
   [[ -n "$_found_sock" && -S "$_found_sock" ]] || { echo "❌ Attach socket missing for sandbox: ${SANDBOX_ID:-unknown}"; exit 1; }
   echo "▶ Attaching to sandbox: ${SANDBOX_ID:-unknown} (${WORKSPACE_NAME:-unknown})"
@@ -981,6 +1018,11 @@ BWRAP=(
   --setenv HTTP_PROXY  ""
   --setenv ALL_PROXY   ""
   --setenv NO_PROXY    "127.0.0.1,localhost,::1"
+  # MED-6: disable git hooks to prevent network isolation bypass via
+  # hook scripts in writable workdirs (e.g. post-checkout, pre-push).
+  --setenv GIT_CONFIG_VALUE_0 "/dev/null"
+  --setenv GIT_CONFIG_KEY_0  "core.hooksPath"
+  --setenv GIT_CONFIG_COUNT  "1"
 
   # CRIT-3: pass init-script control values via --setenv so the bash -c script
   # below contains NO interpolation of user-controlled strings.
@@ -1044,6 +1086,7 @@ if [[ "$ENABLE_GITHUB_MCP" == true ]]; then
     --setenv _MCP_SOCK "$SANDBOX_SOCKET_MCP"
     --setenv _MCP_PORT "$PORT_MCP"
     --setenv _ENABLE_GITHUB_MCP "true"
+    --setenv _MCP_DUMMY_TOKEN "$SESSION_DUMMY_TOKEN"
   )
 fi
 
@@ -1422,7 +1465,9 @@ SANDBOX_INIT_SCRIPT='
   fi
 
   # Start attach shell listener (socat) for external access via --attach
+  # MED-7: enforce restrictive permissions on attach socket directory.
   if command -v socat >/dev/null 2>&1; then
+    chmod 700 /run/attach 2>/dev/null || true
     socat UNIX-LISTEN:/run/attach/shell.sock,fork,mode=600 \
       EXEC:"bash -li",pty,stderr,setsid,sigint,sane &
   fi
@@ -1449,7 +1494,10 @@ SANDBOX_INIT_SCRIPT='
   "mcpServers": {
     "github": {
       "type": "url",
-      "url": "http://127.0.0.1:${_MCP_PORT}/mcp"
+      "url": "http://127.0.0.1:${_MCP_PORT}/mcp",
+      "headers": {
+        "Authorization": "Bearer ${_MCP_DUMMY_TOKEN}"
+      }
     }
   }
 }
@@ -1461,7 +1509,7 @@ MCPEOF
 
   # Save _LAUNCH_SHELL before cleaning up internal init vars.
   _ls="$_LAUNCH_SHELL"
-  unset _PROXY_SOCK _PROXY_PORT _GITHUB_SOCK _GITHUB_PORT _ISOLATE_NET _ENABLE_GITHUB _LAUNCH_SHELL _SHARE_SESSIONS _ENABLE_GITHUB_MCP _MCP_SOCK _MCP_PORT
+  unset _PROXY_SOCK _PROXY_PORT _GITHUB_SOCK _GITHUB_PORT _ISOLATE_NET _ENABLE_GITHUB _LAUNCH_SHELL _SHARE_SESSIONS _ENABLE_GITHUB_MCP _MCP_SOCK _MCP_PORT _MCP_DUMMY_TOKEN
 
   if [[ "$_ls" == true ]]; then
     exec bash
