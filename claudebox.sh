@@ -100,6 +100,7 @@ OUTPUT_DIR=""          # separate writable output directory
 CACHE_HOME=""          # cache directory for sandbox home state
 SECCOMP=false          # enable seccomp syscall filter
 IMAGE=""               # container image root filesystem (extracted rootfs directory)
+SHARE_ROCM=false       # share ROCm GPU devices (/dev/kfd, /dev/dri) into the sandbox
 
 # ---------------------------------------------------------------------------
 # Profile pre-scan: extract --profile from args, load profile options, and
@@ -210,6 +211,7 @@ while [[ $# -gt 0 ]]; do
     --timeout)
       [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1 )) || { echo "❌ --timeout: invalid value '$2' (minutes, >= 1)"; exit 1; }
       WALL_TIMEOUT=$2; shift 2 ;;
+    --share-rocm)        SHARE_ROCM=true; shift ;;
     --dry-run)  DRY_RUN=true; shift ;;
     --token-limit)
       [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1000 )) || { echo "❌ --token-limit: invalid value '$2' (minimum 1000)"; exit 1; }
@@ -287,6 +289,9 @@ OPTIONS:
                          Profile files contain claudebox options (one per line, # comments).
   --image DIR            Use DIR as the root filesystem (extracted container image / rootfs).
                          Replaces host /usr bind with image's /usr, /lib, /bin, etc.
+  --share-rocm           Share ROCm GPU devices (/dev/kfd, /dev/dri) into the sandbox.
+                         Also exposes /sys/class/kfd, /sys/devices (for GPU topology),
+                         and /opt/rocm (ROCm libraries, if present).
   --dry-run              Print the bwrap command without executing it.
   --mem-limit SIZE       Memory limit (e.g. 4G, 512M). Uses cgroups via systemd-run.
   --cpu-limit PERCENT    CPU limit as percentage (100 = 1 core, 200 = 2 cores).
@@ -1105,6 +1110,41 @@ fi
 # Output directory: separate writable mount at /output
 if [[ -n "$OUTPUT_DIR" ]]; then
   BWRAP+=(--bind "$OUTPUT_DIR" /output)
+fi
+
+# ROCm GPU passthrough: bind-mount /dev/kfd, /dev/dri, and required sysfs paths
+if [[ "$SHARE_ROCM" == true ]]; then
+  # /dev/kfd — ROCm kernel fusion driver (required for all ROCm GPU access)
+  if [[ -e /dev/kfd ]]; then
+    BWRAP+=(--dev-bind /dev/kfd /dev/kfd)
+  else
+    echo "⚠ --share-rocm: /dev/kfd not found (ROCm kernel driver not loaded?)"
+  fi
+  # /dev/dri — DRM render nodes (renderD128 etc.) used by ROCm and OpenCL
+  if [[ -d /dev/dri ]]; then
+    BWRAP+=(--dev-bind /dev/dri /dev/dri)
+  else
+    echo "⚠ --share-rocm: /dev/dri not found"
+  fi
+  # sysfs paths required by ROCm runtime for GPU topology and device discovery.
+  # The main BWRAP array sets --tmpfs /sys; we overlay specific paths back.
+  for _sys_path in /sys/class/kfd /sys/class/drm /sys/devices; do
+    [[ -d "$_sys_path" ]] && BWRAP+=(--ro-bind "$_sys_path" "$_sys_path")
+  done
+  # /opt/rocm — ROCm userspace libraries, compilers, and tools
+  if [[ -d /opt/rocm ]]; then
+    BWRAP+=(--ro-bind /opt/rocm /opt/rocm)
+    # Add ROCm binaries to PATH and libraries to LD_LIBRARY_PATH
+    BWRAP+=(
+      --setenv PATH "$SANDBOX_HOME/.local/bin:/opt/rocm/bin:/usr/local/bin:/usr/bin:/bin"
+      --setenv LD_LIBRARY_PATH "/opt/rocm/lib"
+      --setenv ROCM_PATH "/opt/rocm"
+    )
+    # Forward HSA_OVERRIDE_GFX_VERSION if set on host (needed for some GPU families)
+    [[ -n "${HSA_OVERRIDE_GFX_VERSION:-}" ]] && \
+      BWRAP+=(--setenv HSA_OVERRIDE_GFX_VERSION "$HSA_OVERRIDE_GFX_VERSION")
+  fi
+  echo "✔ ROCm GPU devices shared into sandbox"
 fi
 
 # ~/.claude sharing
