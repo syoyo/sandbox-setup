@@ -101,6 +101,7 @@ CACHE_HOME=""          # cache directory for sandbox home state
 SECCOMP=false          # enable seccomp syscall filter
 IMAGE=""               # container image root filesystem (extracted rootfs directory)
 SHARE_ROCM=false       # share ROCm GPU devices (/dev/kfd, /dev/dri) into the sandbox
+SHARE_NVIDIA=false     # share NVIDIA GPU devices (/dev/nvidia*) into the sandbox
 
 # ---------------------------------------------------------------------------
 # Profile pre-scan: extract --profile from args, load profile options, and
@@ -212,6 +213,7 @@ while [[ $# -gt 0 ]]; do
       [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1 )) || { echo "❌ --timeout: invalid value '$2' (minutes, >= 1)"; exit 1; }
       WALL_TIMEOUT=$2; shift 2 ;;
     --share-rocm)        SHARE_ROCM=true; shift ;;
+    --share-nvidia)      SHARE_NVIDIA=true; shift ;;
     --dry-run)  DRY_RUN=true; shift ;;
     --token-limit)
       [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1000 )) || { echo "❌ --token-limit: invalid value '$2' (minimum 1000)"; exit 1; }
@@ -292,6 +294,9 @@ OPTIONS:
   --share-rocm           Share ROCm GPU devices (/dev/kfd, /dev/dri) into the sandbox.
                          Also exposes /sys/class/kfd, /sys/devices (for GPU topology),
                          and /opt/rocm (ROCm libraries, if present).
+  --share-nvidia         Share NVIDIA GPU devices (/dev/nvidia*) into the sandbox.
+                         Also exposes /dev/nvidiactl, /dev/nvidia-uvm, CUDA libraries,
+                         and nvidia-smi.
   --dry-run              Print the bwrap command without executing it.
   --mem-limit SIZE       Memory limit (e.g. 4G, 512M). Uses cgroups via systemd-run.
   --cpu-limit PERCENT    CPU limit as percentage (100 = 1 core, 200 = 2 cores).
@@ -1145,6 +1150,57 @@ if [[ "$SHARE_ROCM" == true ]]; then
       BWRAP+=(--setenv HSA_OVERRIDE_GFX_VERSION "$HSA_OVERRIDE_GFX_VERSION")
   fi
   echo "✔ ROCm GPU devices shared into sandbox"
+fi
+
+# NVIDIA GPU passthrough: bind-mount /dev/nvidia*, CUDA libs, and nvidia-smi
+if [[ "$SHARE_NVIDIA" == true ]]; then
+  # /dev/nvidiactl — NVIDIA control device (required)
+  if [[ -e /dev/nvidiactl ]]; then
+    BWRAP+=(--dev-bind /dev/nvidiactl /dev/nvidiactl)
+  else
+    echo "⚠ --share-nvidia: /dev/nvidiactl not found (NVIDIA driver not loaded?)"
+  fi
+  # /dev/nvidia-uvm — Unified Virtual Memory (used by CUDA)
+  if [[ -e /dev/nvidia-uvm ]]; then
+    BWRAP+=(--dev-bind /dev/nvidia-uvm /dev/nvidia-uvm)
+  fi
+  if [[ -e /dev/nvidia-uvm-tools ]]; then
+    BWRAP+=(--dev-bind /dev/nvidia-uvm-tools /dev/nvidia-uvm-tools)
+  fi
+  # /dev/nvidia-modeset — for display/modeset support
+  if [[ -e /dev/nvidia-modeset ]]; then
+    BWRAP+=(--dev-bind /dev/nvidia-modeset /dev/nvidia-modeset)
+  fi
+  # /dev/nvidia0, /dev/nvidia1, ... — individual GPU devices
+  _nvidia_found=false
+  for _dev in /dev/nvidia[0-9]*; do
+    [[ -e "$_dev" ]] || continue
+    BWRAP+=(--dev-bind "$_dev" "$_dev")
+    _nvidia_found=true
+  done
+  if [[ "$_nvidia_found" != true ]]; then
+    echo "⚠ --share-nvidia: no /dev/nvidia[0-9]* devices found"
+  fi
+  # sysfs paths for NVIDIA device discovery
+  for _sys_path in /sys/class/drm /sys/devices; do
+    [[ -d "$_sys_path" ]] && BWRAP+=(--ro-bind "$_sys_path" "$_sys_path")
+  done
+  # NVIDIA userspace: driver libraries and CUDA toolkit
+  # nvidia-smi and driver libs are typically under /usr, already shared.
+  # Bind /usr/local/cuda if present (CUDA toolkit).
+  if [[ -d /usr/local/cuda ]]; then
+    BWRAP+=(--ro-bind /usr/local/cuda /usr/local/cuda)
+    BWRAP+=(
+      --setenv PATH "$SANDBOX_HOME/.local/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
+      --setenv LD_LIBRARY_PATH "/usr/local/cuda/lib64"
+    )
+  fi
+  # Forward CUDA-related env vars from host if set
+  [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]] && \
+    BWRAP+=(--setenv CUDA_VISIBLE_DEVICES "$CUDA_VISIBLE_DEVICES")
+  [[ -n "${NVIDIA_VISIBLE_DEVICES:-}" ]] && \
+    BWRAP+=(--setenv NVIDIA_VISIBLE_DEVICES "$NVIDIA_VISIBLE_DEVICES")
+  echo "✔ NVIDIA GPU devices shared into sandbox"
 fi
 
 # ~/.claude sharing
