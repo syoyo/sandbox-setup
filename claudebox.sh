@@ -1125,6 +1125,24 @@ if [[ -n "$OUTPUT_DIR" ]]; then
   BWRAP+=(--bind "$OUTPUT_DIR" /output)
 fi
 
+# GPU sysfs helper: track bound paths to avoid duplicates when both ROCm and
+# NVIDIA are enabled (MEDIUM-1).
+_bound_sysfs=()
+_bind_sysfs() {
+  local _p
+  for _p in "$@"; do
+    local _existing
+    for _existing in "${_bound_sysfs[@]+"${_bound_sysfs[@]}"}"; do
+      [[ "$_existing" == "$_p" ]] && continue 2
+    done
+    [[ -d "$_p" ]] && BWRAP+=(--ro-bind "$_p" "$_p") && _bound_sysfs+=("$_p")
+  done
+}
+# Accumulate extra PATH and LD_LIBRARY_PATH entries from GPU/binary sections
+# to avoid clobbering (MEDIUM-2). Applied once after all sections.
+_EXTRA_PATH=()
+_EXTRA_LD_PATH=()
+
 # ROCm GPU passthrough: bind-mount /dev/kfd, /dev/dri, and required sysfs paths
 if [[ "$SHARE_ROCM" == true ]]; then
   # /dev/kfd — ROCm kernel fusion driver (required for all ROCm GPU access)
@@ -1141,23 +1159,22 @@ if [[ "$SHARE_ROCM" == true ]]; then
   fi
   # sysfs paths required by ROCm runtime for GPU topology and device discovery.
   # The main BWRAP array sets --tmpfs /sys; we overlay specific paths back.
-  for _sys_path in /sys/class/kfd /sys/class/drm /sys/devices; do
-    [[ -d "$_sys_path" ]] && BWRAP+=(--ro-bind "$_sys_path" "$_sys_path")
-  done
+  # NOTE (MEDIUM-3): /sys/devices is broad (exposes CPU/memory/PCI topology) but
+  # required — kfd and DRM class symlinks resolve into /sys/devices/.
+  _bind_sysfs /sys/class/kfd /sys/class/drm /sys/devices
+  [[ -d /sys/module/amdgpu ]] && _bind_sysfs /sys/module/amdgpu
   # /opt/rocm — ROCm userspace libraries, compilers, and tools
   if [[ -d /opt/rocm ]]; then
     BWRAP+=(--ro-bind /opt/rocm /opt/rocm)
-    # Add ROCm binaries to PATH and libraries to LD_LIBRARY_PATH
-    BWRAP+=(
-      --setenv PATH "$SANDBOX_HOME/.local/bin:/opt/rocm/bin:/usr/local/bin:/usr/bin:/bin"
-      --setenv LD_LIBRARY_PATH "/opt/rocm/lib"
-      --setenv ROCM_PATH "/opt/rocm"
-    )
+    _EXTRA_PATH+=("/opt/rocm/bin")
+    _EXTRA_LD_PATH+=("/opt/rocm/lib")
+    BWRAP+=(--setenv ROCM_PATH "/opt/rocm")
     # Forward HSA_OVERRIDE_GFX_VERSION if set on host (needed for some GPU families)
     [[ -n "${HSA_OVERRIDE_GFX_VERSION:-}" ]] && \
       BWRAP+=(--setenv HSA_OVERRIDE_GFX_VERSION "$HSA_OVERRIDE_GFX_VERSION")
   fi
   echo "✔ ROCm GPU devices shared into sandbox"
+  echo "  ⚠ GPU devices are shared read-write (--dev-bind); sandboxed code has full ioctl access."
 fi
 
 # NVIDIA GPU passthrough: bind-mount /dev/nvidia*, CUDA libs, and nvidia-smi
@@ -1182,8 +1199,16 @@ if [[ "$SHARE_NVIDIA" == true ]]; then
   # /dev/nvidia0, /dev/nvidia1, ... — individual GPU devices
   _nvidia_found=false
   if [[ -n "$NVIDIA_DEVICES" ]]; then
-    # Expose only the requested GPU indices
-    IFS=',' read -ra _gpu_ids <<< "$NVIDIA_DEVICES"
+    # Expose only the requested GPU indices (deduplicate — LOW-1)
+    IFS=',' read -ra _gpu_ids_raw <<< "$NVIDIA_DEVICES"
+    _gpu_ids=()
+    for _id in "${_gpu_ids_raw[@]}"; do
+      _dup=false
+      for _existing in "${_gpu_ids[@]+"${_gpu_ids[@]}"}"; do
+        [[ "$_existing" == "$_id" ]] && { _dup=true; break; }
+      done
+      [[ "$_dup" == false ]] && _gpu_ids+=("$_id")
+    done
     for _id in "${_gpu_ids[@]}"; do
       if [[ -e "/dev/nvidia${_id}" ]]; then
         BWRAP+=(--dev-bind "/dev/nvidia${_id}" "/dev/nvidia${_id}")
@@ -1192,8 +1217,9 @@ if [[ "$SHARE_NVIDIA" == true ]]; then
         echo "⚠ --nvidia-devices: /dev/nvidia${_id} not found"
       fi
     done
-    # Set CUDA_VISIBLE_DEVICES to the requested indices so CUDA only sees them
-    BWRAP+=(--setenv CUDA_VISIBLE_DEVICES "$NVIDIA_DEVICES")
+    # Set CUDA_VISIBLE_DEVICES to the deduplicated indices
+    _deduped_devs=$(IFS=,; echo "${_gpu_ids[*]}")
+    BWRAP+=(--setenv CUDA_VISIBLE_DEVICES "$_deduped_devs")
   else
     # Expose all GPU devices
     for _dev in /dev/nvidia[0-9]*; do
@@ -1206,27 +1232,30 @@ if [[ "$SHARE_NVIDIA" == true ]]; then
     echo "⚠ --share-nvidia: no /dev/nvidia[0-9]* devices found"
   fi
   # sysfs paths for NVIDIA device discovery
-  for _sys_path in /sys/class/drm /sys/devices; do
-    [[ -d "$_sys_path" ]] && BWRAP+=(--ro-bind "$_sys_path" "$_sys_path")
-  done
+  # NOTE (MEDIUM-3): /sys/devices is broad but required — DRM class symlinks
+  # resolve there. /sys/module/nvidia provides driver version info for nvidia-smi.
+  _bind_sysfs /sys/class/drm /sys/devices
+  [[ -d /sys/module/nvidia ]] && _bind_sysfs /sys/module/nvidia
   # NVIDIA userspace: driver libraries and CUDA toolkit
   # nvidia-smi and driver libs are typically under /usr, already shared.
   # Bind /usr/local/cuda if present (CUDA toolkit).
   if [[ -d /usr/local/cuda ]]; then
     BWRAP+=(--ro-bind /usr/local/cuda /usr/local/cuda)
-    BWRAP+=(
-      --setenv PATH "$SANDBOX_HOME/.local/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
-      --setenv LD_LIBRARY_PATH "/usr/local/cuda/lib64"
-    )
+    _EXTRA_PATH+=("/usr/local/cuda/bin")
+    _EXTRA_LD_PATH+=("/usr/local/cuda/lib64")
   fi
   # Forward CUDA-related env vars from host if set (--nvidia-devices already sets
   # CUDA_VISIBLE_DEVICES above, so only forward host value when not selecting GPUs)
   if [[ -z "$NVIDIA_DEVICES" && -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
     BWRAP+=(--setenv CUDA_VISIBLE_DEVICES "$CUDA_VISIBLE_DEVICES")
   fi
-  [[ -n "${NVIDIA_VISIBLE_DEVICES:-}" ]] && \
+  # LOW-2: skip NVIDIA_VISIBLE_DEVICES forwarding when --nvidia-devices is used
+  # to avoid contradicting the explicit GPU selection
+  if [[ -z "$NVIDIA_DEVICES" && -n "${NVIDIA_VISIBLE_DEVICES:-}" ]]; then
     BWRAP+=(--setenv NVIDIA_VISIBLE_DEVICES "$NVIDIA_VISIBLE_DEVICES")
+  fi
   echo "✔ NVIDIA GPU devices shared into sandbox"
+  echo "  ⚠ GPU devices are shared read-write (--dev-bind); sandboxed code has full ioctl access."
 fi
 
 # ~/.claude sharing
@@ -1450,7 +1479,23 @@ if [[ "$BIND_BINARIES" == true ]]; then
     --ro-bind "$NODE_BIN"   /run/sandbox-bin/node
     --ro-bind "$CLAUDE_BIN" /run/sandbox-bin/claude
   )
-  BWRAP+=(--setenv PATH "$SANDBOX_HOME/.local/bin:/run/sandbox-bin:/usr/local/bin:/usr/bin:/bin")
+  _EXTRA_PATH+=("/run/sandbox-bin")
+fi
+
+# Apply combined PATH and LD_LIBRARY_PATH (MEDIUM-2: avoids clobbering between
+# --share-rocm, --share-nvidia, --bind-binaries, and the base PATH).
+if [[ ${#_EXTRA_PATH[@]} -gt 0 ]]; then
+  _combined_path="$SANDBOX_HOME/.local/bin"
+  for _p in "${_EXTRA_PATH[@]}"; do _combined_path+=":$_p"; done
+  _combined_path+=":/usr/local/bin:/usr/bin:/bin"
+  BWRAP+=(--setenv PATH "$_combined_path")
+fi
+if [[ ${#_EXTRA_LD_PATH[@]} -gt 0 ]]; then
+  _combined_ld=""
+  for _p in "${_EXTRA_LD_PATH[@]}"; do
+    _combined_ld+="${_combined_ld:+:}$_p"
+  done
+  BWRAP+=(--setenv LD_LIBRARY_PATH "$_combined_ld")
 fi
 
 # ---------------------------------------------------------------------------
