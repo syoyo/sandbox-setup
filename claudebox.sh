@@ -102,6 +102,7 @@ SECCOMP=false          # enable seccomp syscall filter
 IMAGE=""               # container image root filesystem (extracted rootfs directory)
 SHARE_ROCM=false       # share ROCm GPU devices (/dev/kfd, /dev/dri) into the sandbox
 SHARE_NVIDIA=false     # share NVIDIA GPU devices (/dev/nvidia*) into the sandbox
+NVIDIA_DEVICES=""      # comma-separated GPU indices to expose (empty = all)
 
 # ---------------------------------------------------------------------------
 # Profile pre-scan: extract --profile from args, load profile options, and
@@ -214,6 +215,9 @@ while [[ $# -gt 0 ]]; do
       WALL_TIMEOUT=$2; shift 2 ;;
     --share-rocm)        SHARE_ROCM=true; shift ;;
     --share-nvidia)      SHARE_NVIDIA=true; shift ;;
+    --nvidia-devices)
+      [[ -n "${2:-}" && "$2" =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo "❌ --nvidia-devices: expected comma-separated GPU indices (e.g. 0,1,3)"; exit 1; }
+      SHARE_NVIDIA=true; NVIDIA_DEVICES=$2; shift 2 ;;
     --dry-run)  DRY_RUN=true; shift ;;
     --token-limit)
       [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1000 )) || { echo "❌ --token-limit: invalid value '$2' (minimum 1000)"; exit 1; }
@@ -296,7 +300,11 @@ OPTIONS:
                          and /opt/rocm (ROCm libraries, if present).
   --share-nvidia         Share NVIDIA GPU devices (/dev/nvidia*) into the sandbox.
                          Also exposes /dev/nvidiactl, /dev/nvidia-uvm, CUDA libraries,
-                         and nvidia-smi.
+                         and nvidia-smi. By default exposes all GPUs; use --nvidia-devices
+                         to select specific GPUs.
+  --nvidia-devices LIST  Comma-separated GPU indices to expose (e.g. 0,2,3).
+                         Implies --share-nvidia. Only the listed /dev/nvidiaN devices
+                         are bind-mounted; also sets CUDA_VISIBLE_DEVICES inside sandbox.
   --dry-run              Print the bwrap command without executing it.
   --mem-limit SIZE       Memory limit (e.g. 4G, 512M). Uses cgroups via systemd-run.
   --cpu-limit PERCENT    CPU limit as percentage (100 = 1 core, 200 = 2 cores).
@@ -1173,11 +1181,27 @@ if [[ "$SHARE_NVIDIA" == true ]]; then
   fi
   # /dev/nvidia0, /dev/nvidia1, ... — individual GPU devices
   _nvidia_found=false
-  for _dev in /dev/nvidia[0-9]*; do
-    [[ -e "$_dev" ]] || continue
-    BWRAP+=(--dev-bind "$_dev" "$_dev")
-    _nvidia_found=true
-  done
+  if [[ -n "$NVIDIA_DEVICES" ]]; then
+    # Expose only the requested GPU indices
+    IFS=',' read -ra _gpu_ids <<< "$NVIDIA_DEVICES"
+    for _id in "${_gpu_ids[@]}"; do
+      if [[ -e "/dev/nvidia${_id}" ]]; then
+        BWRAP+=(--dev-bind "/dev/nvidia${_id}" "/dev/nvidia${_id}")
+        _nvidia_found=true
+      else
+        echo "⚠ --nvidia-devices: /dev/nvidia${_id} not found"
+      fi
+    done
+    # Set CUDA_VISIBLE_DEVICES to the requested indices so CUDA only sees them
+    BWRAP+=(--setenv CUDA_VISIBLE_DEVICES "$NVIDIA_DEVICES")
+  else
+    # Expose all GPU devices
+    for _dev in /dev/nvidia[0-9]*; do
+      [[ -e "$_dev" ]] || continue
+      BWRAP+=(--dev-bind "$_dev" "$_dev")
+      _nvidia_found=true
+    done
+  fi
   if [[ "$_nvidia_found" != true ]]; then
     echo "⚠ --share-nvidia: no /dev/nvidia[0-9]* devices found"
   fi
@@ -1195,9 +1219,11 @@ if [[ "$SHARE_NVIDIA" == true ]]; then
       --setenv LD_LIBRARY_PATH "/usr/local/cuda/lib64"
     )
   fi
-  # Forward CUDA-related env vars from host if set
-  [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]] && \
+  # Forward CUDA-related env vars from host if set (--nvidia-devices already sets
+  # CUDA_VISIBLE_DEVICES above, so only forward host value when not selecting GPUs)
+  if [[ -z "$NVIDIA_DEVICES" && -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
     BWRAP+=(--setenv CUDA_VISIBLE_DEVICES "$CUDA_VISIBLE_DEVICES")
+  fi
   [[ -n "${NVIDIA_VISIBLE_DEVICES:-}" ]] && \
     BWRAP+=(--setenv NVIDIA_VISIBLE_DEVICES "$NVIDIA_VISIBLE_DEVICES")
   echo "✔ NVIDIA GPU devices shared into sandbox"
