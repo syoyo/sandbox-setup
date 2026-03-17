@@ -2,9 +2,10 @@
 /**
  * credential-proxy.js
  *
- * Anthropic credential injection proxy for sandboxed Claude Code.
- * Listens on a Unix domain socket (host side), replaces dummy Claude tokens
- * with real ones before forwarding requests to api.anthropic.com.
+ * LLM credential injection proxy for sandboxed Claude Code.
+ * Supports multiple LLM services via presets (Anthropic, OpenAI, etc.).
+ * Listens on Unix domain sockets (host side), replaces dummy tokens
+ * with real ones before forwarding requests to upstream APIs.
  *
  * Also runs a HTTPS CONNECT proxy that whitelists specific upstream hosts
  * (empty allowlist by default; api.github.com added with --enable-github).
@@ -17,6 +18,7 @@
  *     --anthropic-socket /tmp/claude-proxy-anthropic.sock \
  *     --anthropic-tcp-port 58080 \
  *     --github-connect-port 58081 [--enable-github]
+ *     --service openai --openai-socket /tmp/claude-proxy-openai.sock
  *
  * In-sandbox bridge mode (started by claudebox.sh --no-network):
  *   node credential-proxy.js --bridge-only \
@@ -70,6 +72,105 @@ const MAX_CONNECTIONS = 100;
 // MCP proxy path allowlist — only /mcp and /sse endpoints.
 const MCP_PATH_ALLOWLIST = /^\/(mcp|sse)(\/|$)/;
 
+// ---------------------------------------------------------------------------
+// LLM service presets — multi-service credential proxy support.
+// Each preset defines upstream host, path allowlist, auth handling,
+// and credential retrieval for one LLM API provider.
+// ---------------------------------------------------------------------------
+
+const SERVICE_PRESETS = {
+  anthropic: {
+    name: 'anthropic',
+    upstream: 'api.anthropic.com',
+    upstreamPort: 443,
+    pathAllowlist: /^\/v1\/(messages|complete|models|count_tokens)(\/|$)/,
+    authHeaders: ['authorization', 'x-api-key'],
+    defaultPort: 58080,
+    envBaseUrl: 'ANTHROPIC_BASE_URL',
+    getCredential: () => getAccessToken(),
+    extractUsage(statusCode, isStreaming, respText, tail) {
+      if (statusCode !== 200) return null;
+      if (isStreaming) {
+        try {
+          const lines = tail.split('\n').filter(l => l.startsWith('data: ') && l.includes('"usage"'));
+          if (lines.length > 0) {
+            const lastData = JSON.parse(lines[lines.length - 1].slice(6));
+            return lastData.usage || (lastData.message && lastData.message.usage) || null;
+          }
+        } catch (_) {}
+      } else {
+        try { return JSON.parse(respText).usage || null; } catch (_) {}
+      }
+      return null;
+    },
+  },
+  openai: {
+    name: 'openai',
+    upstream: 'api.openai.com',
+    upstreamPort: 443,
+    pathAllowlist: /^\/v1\/(chat\/completions|completions|models|embeddings|audio|images|moderations|files|fine_tuning|batches|responses)(\/|$)/,
+    authHeaders: ['authorization'],
+    defaultPort: 58083,
+    envBaseUrl: 'OPENAI_BASE_URL',
+    getCredential: () => getOpenAIKey(),
+    extractUsage(statusCode, isStreaming, respText, tail) {
+      if (statusCode !== 200) return null;
+      const normalize = (u) => u ? { input_tokens: u.prompt_tokens || 0, output_tokens: u.completion_tokens || 0 } : null;
+      if (isStreaming) {
+        try {
+          const lines = tail.split('\n').filter(l => l.startsWith('data: ') && l.includes('"usage"'));
+          if (lines.length > 0) return normalize(JSON.parse(lines[lines.length - 1].slice(6)).usage);
+        } catch (_) {}
+      } else {
+        try { return normalize(JSON.parse(respText).usage); } catch (_) {}
+      }
+      return null;
+    },
+  },
+};
+
+// ---------------------------------------------------------------------------
+// OpenAI credential retrieval
+// ---------------------------------------------------------------------------
+let _openaiCredsCache = null;
+let _openaiCredsCacheTime = 0;
+
+function getOpenAIKey() {
+  const now = Date.now();
+  if (_openaiCredsCache && now - _openaiCredsCacheTime < CACHE_TTL_MS) return _openaiCredsCache;
+
+  let key = null;
+
+  // 1. Dedicated credential file (like CLAUDE_CREDENTIALS_FILE for Anthropic)
+  const envFile = process.env.OPENAI_CREDENTIALS_FILE;
+  if (envFile) {
+    try { key = fs.readFileSync(envFile, 'utf8').trim(); } catch (_) {}
+  }
+
+  // 2. _REAL_OPENAI_API_KEY — set by claudebox.sh before replacing OPENAI_API_KEY with dummy.
+  // This prevents the proxy from reading the dummy token from its own env.
+  if (!key && process.env._REAL_OPENAI_API_KEY) key = process.env._REAL_OPENAI_API_KEY;
+
+  // 3. OPENAI_API_KEY env var (fallback; works when proxy env is not modified)
+  if (!key && process.env.OPENAI_API_KEY) key = process.env.OPENAI_API_KEY;
+
+  // 4. File-based fallbacks
+  if (!key) {
+    for (const p of [
+      path.join(os.homedir(), '.config', 'claudebox', 'openai-key'),
+      path.join(os.homedir(), '.config', 'openai', 'api_key'),
+    ]) {
+      try {
+        const content = fs.readFileSync(p, 'utf8').trim();
+        if (content) { key = content; break; }
+      } catch (_) {}
+    }
+  }
+
+  if (key) { _openaiCredsCache = key; _openaiCredsCacheTime = now; }
+  return key;
+}
+
 // Private/reserved IP check — covers RFC 1918, loopback, link-local,
 // CGNAT (100.64/10), benchmarking (198.18/15), class E (240/4),
 // broadcast, and IPv6 ULA/link-local/loopback (including expanded forms).
@@ -107,6 +208,10 @@ function parseArgs(argv) {
     bridgeSocket:      null,
     bridgeTcpPort:     null,
     verbose:           false,
+    // Multi-service support
+    services:          [],     // additional service names to enable (e.g. ['openai'])
+    serviceSocket:     {},     // per-service socket overrides: { openai: '/path/to/sock' }
+    servicePort:       {},     // per-service TCP port overrides: { openai: 58083 }
   };
 
   for (let i = 2; i < argv.length; i++) {
@@ -132,6 +237,29 @@ function parseArgs(argv) {
       case '--socket':              args.bridgeSocket  = argv[++i]; break;
       case '--tcp-bridge-port':     args.bridgeTcpPort = parseInt(argv[++i], 10); break;
       case '--verbose':             args.verbose = true; break;
+      // Multi-service support
+      case '--service': {
+        const svcName = argv[++i];
+        if (!SERVICE_PRESETS[svcName]) {
+          console.error(`[proxy] Unknown service: ${svcName} (available: ${Object.keys(SERVICE_PRESETS).join(', ')})`);
+          process.exit(1);
+        }
+        if (!args.services.includes(svcName)) args.services.push(svcName);
+        break;
+      }
+      case '--service-socket': {
+        const [sName, sPath] = (argv[++i] || '').split(':', 2);
+        if (sName && sPath) args.serviceSocket[sName] = sPath;
+        break;
+      }
+      case '--service-port': {
+        const [spName, spPort] = (argv[++i] || '').split(':', 2);
+        if (spName && spPort) args.servicePort[spName] = parseInt(spPort, 10);
+        break;
+      }
+      // Convenience shorthands for OpenAI
+      case '--openai-socket':    args.serviceSocket.openai = argv[++i]; break;
+      case '--openai-port':      args.servicePort.openai = parseInt(argv[++i], 10); break;
       case '--help': printHelp(); process.exit(0); break;
       default: console.warn(`[proxy] Unknown argument: ${argv[i]}`);
     }
@@ -146,7 +274,7 @@ function parseArgs(argv) {
 
 function printHelp() {
   console.log(`
-credential-proxy.js — Anthropic credential proxy + HTTPS CONNECT gateway
+credential-proxy.js — LLM credential proxy + HTTPS CONNECT gateway
 
 PROXY MODE (host side — claudebox.sh manages this automatically):
   node credential-proxy.js \\
@@ -157,12 +285,25 @@ PROXY MODE (host side — claudebox.sh manages this automatically):
     --auto-refresh-auth         Run a short host \`claude -p ...\` probe on 401, then retry once if the token changed
     --verbose
 
+MULTI-SERVICE MODE:
+  node credential-proxy.js \\
+    --service openai              Enable OpenAI credential proxy
+    --openai-socket PATH          Unix socket for OpenAI proxy
+    --openai-port PORT            TCP bridge port for OpenAI proxy
+    --service-socket NAME:PATH    Socket path for named service
+    --service-port NAME:PORT      TCP port for named service
+
+  Available service presets: ${Object.keys(SERVICE_PRESETS).join(', ')}
+
 BRIDGE-ONLY MODE (in-sandbox, for --no-network):
   node credential-proxy.js --bridge-only \\
     --socket PATH --tcp-bridge-port PORT
 
 ENVIRONMENT:
-  CLAUDE_CREDENTIALS_FILE   Override Claude credentials file path
+  CLAUDE_CREDENTIALS_FILE     Override Claude credentials file path
+  OPENAI_API_KEY              OpenAI API key (host side)
+  OPENAI_CREDENTIALS_FILE     Override OpenAI credentials file path
+  _REAL_OPENAI_API_KEY        Real OpenAI key (set by claudebox.sh before env swap)
 `);
 }
 
@@ -895,6 +1036,219 @@ function startConnectProxySocket(socketPath, allowlist, verbose) {
 }
 
 // ---------------------------------------------------------------------------
+// Generic LLM service proxy — multi-service support
+// Reuses shared infrastructure (audit log, token tracking, notifications)
+// but has per-service upstream, path allowlist, auth, and credentials.
+// ---------------------------------------------------------------------------
+
+function createGenericServiceHandler(preset, dummyToken, verbose) {
+  const tag = `[${preset.name}]`;
+
+  function injectServiceAuth(headers) {
+    const cred = preset.getCredential();
+    if (!cred) return { ok: false, error: 'Credential error' };
+
+    const updated = {};
+    let replaced = false;
+    for (const [k, v] of Object.entries(headers)) {
+      const kl = k.toLowerCase();
+      if (preset.authHeaders.includes(kl) && typeof v === 'string') {
+        const bare = /^Bearer /i.test(v) ? v.slice(7) : v;
+        if (bare !== dummyToken) {
+          return { ok: false, error: 'Auth header rejected' };
+        }
+        updated[k] = v.replace(dummyToken, cred);
+        replaced = true;
+      } else if (preset.authHeaders.includes(kl)) {
+        return { ok: false, error: 'Auth header rejected' };
+      } else {
+        updated[k] = v;
+      }
+    }
+
+    if (!replaced) {
+      return { ok: false, error: 'Auth header rejected' };
+    }
+    return { ok: true, headers: updated };
+  }
+
+  function forwardServiceRequest(method, urlPath, headers, body, res) {
+    const opts = { hostname: preset.upstream, port: preset.upstreamPort, path: urlPath, method, headers };
+    if (verbose) console.log(`${tag} → ${method} https://${preset.upstream}${urlPath}`);
+
+    const reqStartTime = Date.now();
+    const req = https.request(opts, (upstream) => {
+      if (verbose) console.log(`${tag} ← ${upstream.statusCode}`);
+      const respHeaders = filterResponseHeaders(upstream.headers);
+      const isStreaming = (upstream.headers['content-type'] || '').includes('text/event-stream');
+
+      if (isStreaming && upstream.statusCode === 200) {
+        if (!res.headersSent) res.writeHead(upstream.statusCode, respHeaders);
+        const TAIL_SIZE = 8192;
+        let tail = '';
+        upstream.on('data', (chunk) => {
+          res.write(chunk);
+          tail += chunk.toString('utf8');
+          if (tail.length > TAIL_SIZE * 2) tail = tail.slice(-TAIL_SIZE);
+        });
+        upstream.on('end', () => {
+          const durationMs = Date.now() - reqStartTime;
+          const usage = preset.extractUsage(upstream.statusCode, true, null, tail);
+          if (usage) trackUsage(usage, verbose);
+          auditLog({ event: 'api_request', service: preset.name, method, path: urlPath,
+            status: upstream.statusCode, duration_ms: durationMs,
+            input_tokens: usage ? usage.input_tokens : null,
+            output_tokens: usage ? usage.output_tokens : null,
+            cumulative_tokens: getTotalTokens() });
+          res.end();
+        });
+      } else {
+        const respChunks = [];
+        let respLen = 0;
+        let respAborted = false;
+        upstream.on('data', (chunk) => {
+          if (respAborted) return;
+          respLen += chunk.length;
+          if (respLen > MAX_RESPONSE_SIZE) {
+            respAborted = true;
+            upstream.destroy();
+            if (!res.headersSent) { res.writeHead(502); res.end('Response too large'); }
+            return;
+          }
+          respChunks.push(chunk);
+        });
+        upstream.on('end', () => {
+          if (respAborted) return;
+          const respBody = Buffer.concat(respChunks);
+          const durationMs = Date.now() - reqStartTime;
+          const respText = respBody.toString('utf8');
+
+          const usage = preset.extractUsage(upstream.statusCode, false, respText, null);
+          if (usage) trackUsage(usage, verbose);
+
+          auditLog({ event: 'api_request', service: preset.name, method, path: urlPath,
+            status: upstream.statusCode, duration_ms: durationMs,
+            input_tokens: usage ? usage.input_tokens : null,
+            output_tokens: usage ? usage.output_tokens : null,
+            cumulative_tokens: getTotalTokens() });
+
+          if (!res.headersSent) res.writeHead(upstream.statusCode, respHeaders);
+          res.end(respBody);
+        });
+      }
+    });
+
+    req.on('error', (err) => {
+      console.error(`${tag} upstream error:`, err.message);
+      auditLog({ event: 'api_error', service: preset.name, method, path: urlPath, error: err.message });
+      if (!res.headersSent) { res.writeHead(502); res.end('Bad Gateway'); }
+    });
+
+    if (body && body.length) req.write(body);
+    req.end();
+  }
+
+  return function handler(req, res) {
+    const parsed = new URL(req.url, 'http://localhost');
+    const normalizedPath = path.posix.normalize(parsed.pathname);
+
+    if (!preset.pathAllowlist.test(normalizedPath)) {
+      if (verbose) console.log(`${tag} blocked path: ${normalizedPath}`);
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Path not allowed' }));
+      return;
+    }
+
+    // Shared token budget enforcement
+    if (_forward_tokenLimit > 0 && (_tokenLimitExceeded || getTotalTokens() >= _forward_tokenLimit)) {
+      _tokenLimitExceeded = true;
+      res.writeHead(429, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Token budget exceeded', total_tokens: getTotalTokens(), limit: _forward_tokenLimit }));
+      auditLog({ event: 'token_limit_rejected', service: preset.name, path: normalizedPath, total: getTotalTokens(), limit: _forward_tokenLimit });
+      return;
+    }
+
+    const forwardUrl = normalizedPath + parsed.search;
+    touchActivity();
+
+    const chunks = [];
+    let bodyLen = 0;
+    let aborted = false;
+    req.on('data', (c) => {
+      if (aborted) return;
+      bodyLen += c.length;
+      if (bodyLen > MAX_BODY_SIZE) {
+        aborted = true;
+        req.destroy();
+        if (!res.headersSent) {
+          res.writeHead(413, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Request body too large' }));
+        }
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      if (aborted) return;
+      const body = Buffer.concat(chunks);
+      const base = filterRequestHeaders(req.headers);
+      base['host'] = preset.upstream;
+
+      const result = injectServiceAuth(base);
+      if (!result.ok) {
+        console.error(`${tag} credential error:`, result.error);
+        res.writeHead(401, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Authentication failed' }));
+        return;
+      }
+      const h = result.headers;
+      if (body.length) h['content-length'] = String(body.length);
+      forwardServiceRequest(req.method, forwardUrl, h, body, res);
+    });
+  };
+}
+
+/**
+ * Start a generic service proxy on a Unix socket with a TCP bridge.
+ * Returns { server, socketPath, tcpPort } for cleanup.
+ */
+function startGenericServiceProxy(presetName, socketPath, tcpPort, dummyToken, verbose) {
+  const preset = SERVICE_PRESETS[presetName];
+  if (!preset) {
+    console.error(`[proxy] Unknown service preset: ${presetName}`);
+    process.exit(1);
+  }
+
+  const tag = `[${presetName}]`;
+
+  if (fs.existsSync(socketPath)) fs.unlinkSync(socketPath);
+
+  const handler = createGenericServiceHandler(preset, dummyToken, verbose);
+  const server = http.createServer(handler);
+  server.maxConnections = MAX_CONNECTIONS;
+  server.requestTimeout = 120_000;
+  server.headersTimeout = 30_000;
+  server.listen(socketPath, () => {
+    console.log(`${tag} Listening on ${socketPath}`);
+  });
+  server.on('error', (err) => {
+    console.error(`${tag} Server error:`, err.message);
+    process.exit(1);
+  });
+
+  // TCP bridge for in-sandbox access
+  startTcpBridge(socketPath, tcpPort, presetName);
+
+  const credCheck = preset.getCredential();
+  if (!credCheck) {
+    console.warn(`${tag} ⚠ No credentials found — requests will fail until credentials are available`);
+  }
+  console.log(`${tag} Path allowlist: ${preset.pathAllowlist.toString()}`);
+
+  return { server, socketPath, tcpPort };
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -977,6 +1331,10 @@ if (args.bridgeOnly) {
     try { fs.unlinkSync(socketPath); } catch (_) {}
     if (githubSocketPath) { try { fs.unlinkSync(githubSocketPath); } catch (_) {} }
     if (mcpBridgeSocketPath) { try { fs.unlinkSync(mcpBridgeSocketPath); } catch (_) {} }
+    // Clean up additional service proxy sockets
+    for (const svc of _serviceProxies) {
+      try { fs.unlinkSync(svc.socketPath); } catch (_) {}
+    }
     process.exit(0);
   };
   process.on('SIGINT', cleanup);
@@ -1013,4 +1371,21 @@ if (args.bridgeOnly) {
 
   console.log('[anthropic] Credential sources: CLAUDE_CREDENTIALS_FILE → macOS Keychain → ~/.claude/.credentials.json');
   console.log('[anthropic] Path allowlist:', ANTHROPIC_PATH_ALLOWLIST.toString());
+
+  // -------------------------------------------------------------------------
+  // Start additional service proxies (--service openai, etc.)
+  // -------------------------------------------------------------------------
+  const _serviceProxies = [];
+  for (const svcName of args.services) {
+    if (svcName === 'anthropic') continue; // already handled above
+    const preset = SERVICE_PRESETS[svcName];
+    if (!preset) {
+      console.error(`[proxy] Unknown service: ${svcName}`);
+      process.exit(1);
+    }
+    const svcSocket = args.serviceSocket[svcName] || socketPath.replace('anthropic', svcName);
+    const svcPort = args.servicePort[svcName] || preset.defaultPort;
+    const result = startGenericServiceProxy(svcName, svcSocket, svcPort, DUMMY_CLAUDE_TOKEN, args.verbose);
+    _serviceProxies.push(result);
+  }
 }
