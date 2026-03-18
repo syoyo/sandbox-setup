@@ -50,9 +50,11 @@ fi
 SOCKET_ANTHROPIC="$_SOCK_DIR/claude-proxy-anthropic-$$.sock"
 SOCKET_GITHUB="$_SOCK_DIR/claude-proxy-github-$$.sock"
 SOCKET_MCP="$_SOCK_DIR/claude-proxy-mcp-$$.sock"
+SOCKET_SLACK="$_SOCK_DIR/claude-proxy-slack-$$.sock"
 SANDBOX_SOCKET_ANTHROPIC="/tmp/claude-proxy-anthropic.sock"
 SANDBOX_SOCKET_MCP="/tmp/claude-proxy-mcp.sock"
 SANDBOX_SOCKET_GITHUB="/tmp/claude-proxy-github.sock"
+SANDBOX_SOCKET_SLACK="/tmp/claude-proxy-slack.sock"
 SANDBOX_DUMMY_CREDS="/run/dummy-claude-credentials.json"
 SANDBOX_WORKDIR="/workspace"
 PORT_ANTHROPIC=58080
@@ -71,6 +73,7 @@ ENABLE_GITHUB=false
 ENABLE_GITHUB_MCP=false
 AUTO_REFRESH_AUTH=false
 PORT_MCP=58082             # in-sandbox TCP port for MCP bridge
+PORT_SLACK=58083           # in-sandbox TCP port for Slack webhook proxy
 HOST_PORT_MCP_SERVER=""
 MCP_SERVER_PID=""
 CLAUDE_ARGS=()
@@ -87,6 +90,7 @@ LIST_MODE=false
 INFO_TARGET=""
 NOTIFY_COMMAND=""      # shell command for event notifications
 NOTIFY_WEBHOOK=""      # webhook URL for event notifications (Slack, etc.)
+SLACK_WEBHOOK=""       # Slack webhook URL for in-sandbox proxy (credential stays on host)
 GH_TOKEN_FILE=""       # file containing GitHub PAT (alternative to GH_TOKEN env var)
 ALLOWLIST_URLS=()      # additional HTTPS hosts to whitelist via CONNECT proxy
 READONLY_WORKDIR=false # mount workdir read-only
@@ -193,6 +197,14 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { echo "❌ --info requires a sandbox ID"; exit 1; }
       INFO_TARGET=$2; shift 2 ;;
     --notify-command)  NOTIFY_COMMAND=$2; shift 2 ;;
+    --slack-webhook)
+      # SEC: only allow https webhooks to prevent SSRF.
+      [[ "$2" =~ ^https:// ]] || { echo "❌ --slack-webhook: only https:// URLs allowed"; exit 1; }
+      _sw_host=$(echo "$2" | sed -n 's|^https://\([^/:]*\).*|\1|p')
+      if [[ "$_sw_host" =~ ^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|0\.|100\.(6[4-9]|[7-9][0-9]|1[0-2][0-7])\.|198\.1[89]\.|localhost$|\[::1\]|\[fc|\[fd|\[fe80) ]]; then
+        echo "❌ --slack-webhook: private/internal addresses not allowed"; exit 1
+      fi
+      SLACK_WEBHOOK=$2; shift 2 ;;
     --notify-webhook)
       # MED-1: only allow https webhooks to prevent SSRF to internal services.
       [[ "$2" =~ ^https:// ]] || { echo "❌ --notify-webhook: only https:// URLs allowed"; exit 1; }
@@ -314,6 +326,8 @@ OPTIONS:
   --info ID              Show detailed info for one sandbox, including launch args.
   --notify-command CMD   Run CMD on events (env: CLAUDEBOX_EVENT, CLAUDEBOX_MESSAGE).
   --notify-webhook URL   POST JSON to URL on events (Slack incoming webhook compatible).
+  --slack-webhook URL    Proxy Slack webhook into sandbox (URL stays on host).
+                         Inside sandbox: curl -X POST -d '{"text":"hi"}' http://127.0.0.1:58083
   --anthropic-port PORT  TCP port for Anthropic proxy bridge (default: 58080; range 1024-65535)
   --github-port PORT     TCP port for GitHub CONNECT proxy (default: 58081; range 1024-65535)
   --help                 Show this help
@@ -327,6 +341,7 @@ NETWORK:
 
 ENVIRONMENT:
   GH_TOKEN               GitHub token (or use --gh-token-file / ~/.config/claudebox/gh-token)
+  SLACK_WEBHOOK_URL      Slack webhook URL (or use --slack-webhook / ~/.config/claudebox/slack-webhook)
   CLAUDE_CREDENTIALS_FILE  Override Claude credentials file path
 
 SECURITY PROPERTIES:
@@ -602,6 +617,22 @@ if [[ -z "${GH_TOKEN:-}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Load Slack webhook URL from file if not set via --slack-webhook or env
+# Priority: --slack-webhook flag > SLACK_WEBHOOK_URL env > ~/.config/claudebox/slack-webhook
+# ---------------------------------------------------------------------------
+if [[ -z "$SLACK_WEBHOOK" && -n "${SLACK_WEBHOOK_URL:-}" ]]; then
+  SLACK_WEBHOOK="$SLACK_WEBHOOK_URL"
+fi
+_DEFAULT_SLACK_WEBHOOK_FILE="$HOME/.config/claudebox/slack-webhook"
+if [[ -z "$SLACK_WEBHOOK" && -f "$_DEFAULT_SLACK_WEBHOOK_FILE" ]]; then
+  SLACK_WEBHOOK=$(head -1 "$_DEFAULT_SLACK_WEBHOOK_FILE" | tr -d '[:space:]')
+  if [[ -n "$SLACK_WEBHOOK" ]]; then
+    [[ "$SLACK_WEBHOOK" =~ ^https:// ]] || { echo "❌ slack-webhook file: only https:// URLs allowed"; exit 1; }
+    echo "✔ Slack webhook loaded from $_DEFAULT_SLACK_WEBHOOK_FILE"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # Validate and canonicalise workdir (HIGH-4: symlink/path traversal)
 # ---------------------------------------------------------------------------
 WORKDIR=$(realpath --canonicalize-existing "$WORKDIR" 2>/dev/null) || {
@@ -654,7 +685,7 @@ cleanup() {
   local code=$?
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
   [[ -n "$MCP_SERVER_PID" ]] && kill "$MCP_SERVER_PID" 2>/dev/null || true
-  rm -f "$SOCKET_ANTHROPIC" "$SOCKET_GITHUB" "$SOCKET_MCP" 2>/dev/null || true
+  rm -f "$SOCKET_ANTHROPIC" "$SOCKET_GITHUB" "$SOCKET_MCP" "$SOCKET_SLACK" 2>/dev/null || true
   if [[ -n "${SECCOMP_BPF:-}" ]]; then
     [[ -f "$SECCOMP_BPF" ]] && rm -f "$SECCOMP_BPF" 2>/dev/null || true
     exec 9<&- 2>/dev/null || true
@@ -854,6 +885,11 @@ fi
 [[ "$IDLE_TIMEOUT" -gt 0 ]] && PROXY_ARGS+=(--idle-timeout "$IDLE_TIMEOUT")
 [[ -n "$NOTIFY_COMMAND" ]] && PROXY_ARGS+=(--notify-command "$NOTIFY_COMMAND")
 [[ -n "$NOTIFY_WEBHOOK" ]] && PROXY_ARGS+=(--notify-webhook "$NOTIFY_WEBHOOK")
+# HIGH-3: pass webhook URL via env var (not CLI arg) to avoid /proc/PID/cmdline leak.
+if [[ -n "$SLACK_WEBHOOK" ]]; then
+  export SLACK_WEBHOOK_URL="$SLACK_WEBHOOK"
+  PROXY_ARGS+=(--slack-socket "$SOCKET_SLACK")
+fi
 
 node "$PROXY_SCRIPT" "${PROXY_ARGS[@]}" &
 PROXY_PID=$!
@@ -862,6 +898,7 @@ _wait_sockets() {
   [[ -S "$SOCKET_ANTHROPIC" ]] || return 1
   [[ -S "$SOCKET_GITHUB" ]] || return 1
   [[ "$ENABLE_GITHUB_MCP" == true ]] && { [[ -S "$SOCKET_MCP" ]] || return 1; }
+  [[ -n "$SLACK_WEBHOOK" ]] && { [[ -S "$SOCKET_SLACK" ]] || return 1; }
   return 0
 }
 for _i in $(seq 1 25); do
@@ -872,13 +909,15 @@ done
 [[ -S "$SOCKET_ANTHROPIC" ]] || { echo "❌ Anthropic proxy socket did not appear"; exit 1; }
 [[ -S "$SOCKET_GITHUB" ]]    || { echo "❌ GitHub proxy socket did not appear"; exit 1; }
 [[ "$ENABLE_GITHUB_MCP" == true ]] && { [[ -S "$SOCKET_MCP" ]] || { echo "❌ MCP bridge socket did not appear"; exit 1; }; }
+[[ -n "$SLACK_WEBHOOK" ]] && { [[ -S "$SOCKET_SLACK" ]] || { echo "❌ Slack proxy socket did not appear"; exit 1; }; }
 _gh_desc="none"; [[ "$ENABLE_GITHUB" == true ]] && _gh_desc="api.github.com"
 [[ "$ENABLE_GITHUB_MCP" == true ]] && _gh_desc="${_gh_desc}+mcp"
 if [[ ${#ALLOWLIST_URLS[@]} -gt 0 ]]; then
   _extra="${ALLOWLIST_URLS[*]}"
   [[ "$_gh_desc" == "none" ]] && _gh_desc="$_extra" || _gh_desc="${_gh_desc},${_extra}"
 fi
-echo "✔ Proxy ready (anthropic=$SOCKET_ANTHROPIC, github=$SOCKET_GITHUB, allowlist=$_gh_desc)"
+_slack_desc=""; [[ -n "$SLACK_WEBHOOK" ]] && _slack_desc=", slack=proxy"
+echo "✔ Proxy ready (anthropic=$SOCKET_ANTHROPIC, github=$SOCKET_GITHUB, allowlist=$_gh_desc${_slack_desc})"
 
 # ---------------------------------------------------------------------------
 # Build bwrap command
@@ -1117,6 +1156,17 @@ if [[ "$ENABLE_GITHUB_MCP" == true ]]; then
     --setenv _MCP_PORT "$PORT_MCP"
     --setenv _ENABLE_GITHUB_MCP "true"
     --setenv _MCP_DUMMY_TOKEN "$SESSION_DUMMY_TOKEN"
+  )
+fi
+
+# Slack webhook proxy: bind-mount socket and set env vars for in-sandbox bridge
+if [[ -n "$SLACK_WEBHOOK" ]]; then
+  BWRAP+=(
+    --ro-bind "$SOCKET_SLACK" "$SANDBOX_SOCKET_SLACK"
+    --setenv _SLACK_SOCK "$SANDBOX_SOCKET_SLACK"
+    --setenv _SLACK_PORT "$PORT_SLACK"
+    --setenv _ENABLE_SLACK "true"
+    --setenv SLACK_WEBHOOK_PROXY "http://127.0.0.1:$PORT_SLACK"
   )
 fi
 
@@ -1684,11 +1734,29 @@ MCPEOF
     echo "✔ GitHub MCP server configured (port $_MCP_PORT)"
   fi
 
+  # Slack webhook proxy bridge (Unix socket → in-sandbox TCP)
+  if [[ "${_ENABLE_SLACK:-}" == true ]]; then
+    if [[ "$_ISOLATE_NET" == true ]]; then
+      if command -v node >/dev/null 2>&1 && [[ -f /run/credential-proxy.js ]]; then
+        node /run/credential-proxy.js --bridge-only \
+          --socket "$_SLACK_SOCK" --tcp-bridge-port "$_SLACK_PORT" &
+        for _i in $(seq 1 20); do
+          (echo >/dev/tcp/127.0.0.1/"$_SLACK_PORT") 2>/dev/null && break || true
+          sleep 0.1
+        done
+      elif command -v socat >/dev/null 2>&1; then
+        socat TCP-LISTEN:"$_SLACK_PORT",fork,reuseaddr UNIX-CLIENT:"$_SLACK_SOCK" &
+        sleep 0.3
+      fi
+    fi
+    echo "✔ Slack webhook proxy available at $SLACK_WEBHOOK_PROXY"
+  fi
+
   echo "✔ Sandbox ready  ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL"
 
   # Save _LAUNCH_SHELL before cleaning up internal init vars.
   _ls="$_LAUNCH_SHELL"
-  unset _PROXY_SOCK _PROXY_PORT _GITHUB_SOCK _GITHUB_PORT _ISOLATE_NET _ENABLE_GITHUB _LAUNCH_SHELL _SHARE_SESSIONS _ENABLE_GITHUB_MCP _MCP_SOCK _MCP_PORT _MCP_DUMMY_TOKEN
+  unset _PROXY_SOCK _PROXY_PORT _GITHUB_SOCK _GITHUB_PORT _ISOLATE_NET _ENABLE_GITHUB _LAUNCH_SHELL _SHARE_SESSIONS _ENABLE_GITHUB_MCP _MCP_SOCK _MCP_PORT _MCP_DUMMY_TOKEN _ENABLE_SLACK _SLACK_SOCK _SLACK_PORT
 
   if [[ "$_ls" == true ]]; then
     exec bash
