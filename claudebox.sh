@@ -107,6 +107,12 @@ IMAGE=""               # container image root filesystem (extracted rootfs direc
 SHARE_ROCM=false       # share ROCm GPU devices (/dev/kfd, /dev/dri) into the sandbox
 SHARE_NVIDIA=false     # share NVIDIA GPU devices (/dev/nvidia*) into the sandbox
 NVIDIA_DEVICES=""      # comma-separated GPU indices to expose (empty = all)
+PROXY_ONLY=false       # proxy-only mode: no bwrap/cgroups, just credential proxy + env
+PROXY_SERVICES=()      # additional services to proxy (e.g. "openai")
+PORT_OPENAI=58083      # in-sandbox TCP port for OpenAI proxy
+HOST_PORT_OPENAI=""
+SOCKET_OPENAI="$_SOCK_DIR/claude-proxy-openai-$$.sock"
+SANDBOX_SOCKET_OPENAI="/tmp/claude-proxy-openai.sock"
 
 # ---------------------------------------------------------------------------
 # Profile pre-scan: extract --profile from args, load profile options, and
@@ -231,6 +237,13 @@ while [[ $# -gt 0 ]]; do
     --nvidia-devices)
       [[ -n "${2:-}" && "$2" =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo "❌ --nvidia-devices: expected comma-separated GPU indices (e.g. 0,1,3)"; exit 1; }
       SHARE_NVIDIA=true; NVIDIA_DEVICES=$2; shift 2 ;;
+    --proxy-only)       PROXY_ONLY=true; shift ;;
+    --proxy-service)
+      [[ "$2" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "❌ --proxy-service: invalid service name '$2'"; exit 1; }
+      PROXY_SERVICES+=("$2"); shift 2 ;;
+    --openai-port)
+      [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1024 && $2 <= 65535 )) || { echo "❌ --openai-port: invalid port '$2' (1024-65535)"; exit 1; }
+      PORT_OPENAI=$2; shift 2 ;;
     --dry-run)  DRY_RUN=true; shift ;;
     --token-limit)
       [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1000 )) || { echo "❌ --token-limit: invalid value '$2' (minimum 1000)"; exit 1; }
@@ -319,6 +332,14 @@ OPTIONS:
   --nvidia-devices LIST  Comma-separated GPU indices to expose (e.g. 0,2,3).
                          Implies --share-nvidia. Only the listed /dev/nvidiaN devices
                          are bind-mounted; also sets CUDA_VISIBLE_DEVICES inside sandbox.
+  --proxy-only           Proxy-only mode: no bwrap sandbox or cgroups. Runs the credential
+                         proxy and launches the command directly with env vars pointing to
+                         the proxy. Provides credential protection without full isolation.
+                         Project data is accessed directly (sync mode).
+  --proxy-service NAME   Enable credential proxy for an additional LLM service. Repeatable.
+                         Available presets: anthropic (default), openai.
+                         e.g. --proxy-service openai
+  --openai-port PORT     TCP port for OpenAI proxy bridge (default: 58083; range 1024-65535).
   --dry-run              Print the bwrap command without executing it.
   --mem-limit SIZE       Memory limit (e.g. 4G, 512M). Uses cgroups via systemd-run.
   --cpu-limit PERCENT    CPU limit as percentage (100 = 1 core, 200 = 2 cores).
@@ -345,6 +366,8 @@ ENVIRONMENT:
   GH_TOKEN               GitHub token (or use --gh-token-file / ~/.config/claudebox/gh-token)
   SLACK_WEBHOOK_URL      Slack webhook URL (or use --slack-webhook / ~/.config/claudebox/slack-webhook)
   CLAUDE_CREDENTIALS_FILE  Override Claude credentials file path
+  OPENAI_API_KEY           OpenAI API key (for --proxy-service openai)
+  OPENAI_CREDENTIALS_FILE  Override OpenAI credentials file path
 
 SECURITY PROPERTIES:
   - Only <workdir> is writable; everything else read-only or tmpfs
@@ -585,7 +608,13 @@ fi
 [[ "$PORT_ANTHROPIC" -ne "$PORT_MCP" && "$PORT_GITHUB_CONNECT" -ne "$PORT_MCP" ]] || {
   echo "❌ --mcp-port must differ from --anthropic-port and --github-port"; exit 1; }
 
-if [[ "$ISOLATE_NET" == true ]]; then
+if [[ "$PROXY_ONLY" == true ]]; then
+  # Proxy-only mode: proxy listens on localhost directly
+  HOST_PORT_ANTHROPIC="$PORT_ANTHROPIC"
+  HOST_PORT_GITHUB_CONNECT="$PORT_GITHUB_CONNECT"
+  HOST_PORT_MCP_SERVER="$PORT_MCP"
+  HOST_PORT_OPENAI="$PORT_OPENAI"
+elif [[ "$ISOLATE_NET" == true ]]; then
   HOST_PORT_ANTHROPIC=$(allocate_free_port) || { echo "❌ failed to allocate host Anthropic bridge port"; exit 1; }
   HOST_PORT_GITHUB_CONNECT=$(allocate_free_port) || { echo "❌ failed to allocate host GitHub bridge port"; exit 1; }
   while [[ "$HOST_PORT_GITHUB_CONNECT" == "$HOST_PORT_ANTHROPIC" ]]; do
@@ -595,10 +624,17 @@ if [[ "$ISOLATE_NET" == true ]]; then
   while [[ "$HOST_PORT_MCP_SERVER" == "$HOST_PORT_ANTHROPIC" || "$HOST_PORT_MCP_SERVER" == "$HOST_PORT_GITHUB_CONNECT" ]]; do
     HOST_PORT_MCP_SERVER=$(allocate_free_port) || { echo "❌ failed to allocate host MCP server port"; exit 1; }
   done
+  # Allocate port for OpenAI service if enabled
+  _used_ports="$HOST_PORT_ANTHROPIC $HOST_PORT_GITHUB_CONNECT $HOST_PORT_MCP_SERVER"
+  HOST_PORT_OPENAI=$(allocate_free_port) || { echo "❌ failed to allocate host OpenAI bridge port"; exit 1; }
+  while echo "$_used_ports" | grep -qw "$HOST_PORT_OPENAI"; do
+    HOST_PORT_OPENAI=$(allocate_free_port) || { echo "❌ failed to allocate host OpenAI bridge port"; exit 1; }
+  done
 else
   HOST_PORT_ANTHROPIC="$PORT_ANTHROPIC"
   HOST_PORT_GITHUB_CONNECT="$PORT_GITHUB_CONNECT"
   HOST_PORT_MCP_SERVER="$PORT_MCP"
+  HOST_PORT_OPENAI="$PORT_OPENAI"
 fi
 
 # ---------------------------------------------------------------------------
@@ -687,7 +723,7 @@ cleanup() {
   local code=$?
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
   [[ -n "$MCP_SERVER_PID" ]] && kill "$MCP_SERVER_PID" 2>/dev/null || true
-  rm -f "$SOCKET_ANTHROPIC" "$SOCKET_GITHUB" "$SOCKET_MCP" "$SOCKET_SLACK" 2>/dev/null || true
+  rm -f "$SOCKET_ANTHROPIC" "$SOCKET_GITHUB" "$SOCKET_MCP" "$SOCKET_OPENAI" "$SOCKET_SLACK" 2>/dev/null || true
   if [[ -n "${SECCOMP_BPF:-}" ]]; then
     [[ -f "$SECCOMP_BPF" ]] && rm -f "$SECCOMP_BPF" 2>/dev/null || true
     exec 9<&- 2>/dev/null || true
@@ -756,7 +792,7 @@ notify() {
 # ---------------------------------------------------------------------------
 # Sanity checks
 # ---------------------------------------------------------------------------
-command -v bwrap >/dev/null 2>&1 || { echo "❌ bwrap not found (install bubblewrap)"; exit 1; }
+[[ "$PROXY_ONLY" == true ]] || command -v bwrap >/dev/null 2>&1 || { echo "❌ bwrap not found (install bubblewrap)"; exit 1; }
 command -v node  >/dev/null 2>&1 || { echo "❌ node not found"; exit 1; }
 [[ -f "$PROXY_SCRIPT" ]] || { echo "❌ credential-proxy.js not found at $PROXY_SCRIPT"; exit 1; }
 
@@ -897,6 +933,23 @@ if [[ -n "$SLACK_WEBHOOK" ]]; then
   PROXY_ARGS+=(--slack-socket "$SOCKET_SLACK")
 fi
 
+# Additional LLM service proxies (--proxy-service openai, etc.)
+_HAS_OPENAI=false
+for _svc in "${PROXY_SERVICES[@]+"${PROXY_SERVICES[@]}"}"; do
+  PROXY_ARGS+=(--service "$_svc")
+  case "$_svc" in
+    openai)
+      _HAS_OPENAI=true
+      # Save real OpenAI key for the proxy before we swap it with a dummy
+      if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+        export _REAL_OPENAI_API_KEY="$OPENAI_API_KEY"
+      fi
+      PROXY_ARGS+=(--service-socket "openai:$SOCKET_OPENAI")
+      PROXY_ARGS+=(--service-port "openai:$HOST_PORT_OPENAI")
+      ;;
+  esac
+done
+
 node "$PROXY_SCRIPT" "${PROXY_ARGS[@]}" &
 PROXY_PID=$!
 
@@ -904,6 +957,7 @@ _wait_sockets() {
   [[ -S "$SOCKET_ANTHROPIC" ]] || return 1
   [[ -S "$SOCKET_GITHUB" ]] || return 1
   [[ "$ENABLE_GITHUB_MCP" == true ]] && { [[ -S "$SOCKET_MCP" ]] || return 1; }
+  [[ "$_HAS_OPENAI" == true ]] && { [[ -S "$SOCKET_OPENAI" ]] || return 1; }
   [[ -n "$SLACK_WEBHOOK" ]] && { [[ -S "$SOCKET_SLACK" ]] || return 1; }
   return 0
 }
@@ -915,6 +969,7 @@ done
 [[ -S "$SOCKET_ANTHROPIC" ]] || { echo "❌ Anthropic proxy socket did not appear"; exit 1; }
 [[ -S "$SOCKET_GITHUB" ]]    || { echo "❌ GitHub proxy socket did not appear"; exit 1; }
 [[ "$ENABLE_GITHUB_MCP" == true ]] && { [[ -S "$SOCKET_MCP" ]] || { echo "❌ MCP bridge socket did not appear"; exit 1; }; }
+[[ "$_HAS_OPENAI" == true ]] && { [[ -S "$SOCKET_OPENAI" ]] || { echo "❌ OpenAI proxy socket did not appear"; exit 1; }; }
 [[ -n "$SLACK_WEBHOOK" ]] && { [[ -S "$SOCKET_SLACK" ]] || { echo "❌ Slack proxy socket did not appear"; exit 1; }; }
 _gh_desc="none"; [[ "$ENABLE_GITHUB" == true ]] && _gh_desc="api.github.com"
 [[ "$ENABLE_GITHUB_MCP" == true ]] && _gh_desc="${_gh_desc}+mcp"
@@ -922,8 +977,308 @@ if [[ ${#ALLOWLIST_URLS[@]} -gt 0 ]]; then
   _extra="${ALLOWLIST_URLS[*]}"
   [[ "$_gh_desc" == "none" ]] && _gh_desc="$_extra" || _gh_desc="${_gh_desc},${_extra}"
 fi
+_svc_desc=""
+[[ "$_HAS_OPENAI" == true ]] && _svc_desc=", openai=$SOCKET_OPENAI"
 _slack_desc=""; [[ -n "$SLACK_WEBHOOK" ]] && _slack_desc=", slack=proxy"
-echo "✔ Proxy ready (anthropic=$SOCKET_ANTHROPIC, github=$SOCKET_GITHUB, allowlist=$_gh_desc${_slack_desc})"
+echo "✔ Proxy ready (anthropic=$SOCKET_ANTHROPIC, github=$SOCKET_GITHUB, allowlist=$_gh_desc${_svc_desc}${_slack_desc})"
+
+# ---------------------------------------------------------------------------
+# Diff-on-exit: show git diff --stat if workdir is a git repo
+# (defined early so both proxy-only and sandbox paths can use it)
+# ---------------------------------------------------------------------------
+diff_on_exit() {
+  # Skip for snapshot mode (snapshot_merge handles its own diff)
+  [[ "$SNAPSHOT" == true ]] && return 0
+  # Skip for read-only workdir (no changes possible)
+  [[ "$READONLY_WORKDIR" == true ]] && return 0
+
+  # Only if workdir is a git repo
+  if [[ -d "$WORKDIR/.git" ]] || git -C "$WORKDIR" rev-parse --git-dir &>/dev/null; then
+    local _stat
+    _stat=$(git -C "$WORKDIR" diff --stat 2>/dev/null) || true
+    local _untracked
+    _untracked=$(git -C "$WORKDIR" ls-files --others --exclude-standard 2>/dev/null | head -20) || true
+
+    if [[ -n "$_stat" || -n "$_untracked" ]]; then
+      echo ""
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "  WORKDIR CHANGES"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      if [[ -n "$_stat" ]]; then
+        echo "$_stat" | sed 's/^/  /'
+      fi
+      if [[ -n "$_untracked" ]]; then
+        local _ucount
+        _ucount=$(git -C "$WORKDIR" ls-files --others --exclude-standard 2>/dev/null | wc -l)
+        echo ""
+        echo "  Untracked files ($((${_ucount}))):"
+        echo "$_untracked" | sed 's/^/    /'
+        [[ $_ucount -gt 20 ]] && echo "    ... and $((_ucount - 20)) more"
+      fi
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Filesystem quarantine: scan modified/created files for suspicious patterns
+# (defined early so both proxy-only and sandbox paths can use it)
+# ---------------------------------------------------------------------------
+quarantine_scan() {
+  # Skip for read-only workdir
+  [[ "$READONLY_WORKDIR" == true ]] && return 0
+
+  local scan_dir="$WORKDIR"
+  # For snapshot mode, scan the staging directory
+  [[ "$SNAPSHOT" == true && -d "$SNAPSHOT_STAGING" ]] && scan_dir="$SNAPSHOT_STAGING"
+
+  local warnings=()
+
+  # Check for shell scripts with network commands (potential exfiltration)
+  while IFS= read -r -d '' _f; do
+    local _rel="${_f#"$scan_dir"/}"
+    [[ "$_rel" == .git/* || "$_rel" == node_modules/* ]] && continue
+    if grep -lqE '(curl|wget|nc |ncat|socat)\s' "$_f" 2>/dev/null; then
+      warnings+=("  ⚠ Script with network commands: $_rel")
+    fi
+  done < <(find "$scan_dir" -maxdepth 5 -type f \( -name '*.sh' -o -name '*.bash' \) -print0 2>/dev/null)
+
+  # Check for modified dotfiles (potential persistence)
+  while IFS= read -r -d '' _f; do
+    local _rel="${_f#"$scan_dir"/}"
+    warnings+=("  ⚠ Dotfile present: $_rel")
+  done < <(find "$scan_dir" -maxdepth 2 -type f \( -name '.bashrc' -o -name '.bash_profile' -o -name '.profile' -o -name '.zshrc' \) -print0 2>/dev/null)
+
+  # Check for potential encoded secrets (long base64 strings in text files)
+  while IFS= read -r -d '' _f; do
+    local _rel="${_f#"$scan_dir"/}"
+    [[ "$_rel" == .git/* || "$_rel" == node_modules/* || "$_rel" == *.png || "$_rel" == *.jpg || "$_rel" == *.gz || "$_rel" == *.o ]] && continue
+    if grep -qP '[A-Za-z0-9+/]{80,}={0,2}' "$_f" 2>/dev/null; then
+      warnings+=("  ⚠ Possible encoded secret: $_rel")
+    fi
+  done < <(find "$scan_dir" -maxdepth 5 -type f -size -1M -print0 2>/dev/null | head -z -n 100)
+
+  if [[ ${#warnings[@]} -gt 0 ]]; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  QUARANTINE SCAN (${#warnings[@]} findings)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    printf '%s\n' "${warnings[@]}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    notify quarantine_warning ":warning: Quarantine scan found ${#warnings[@]} suspicious items in \`$(basename "$WORKDIR")\`"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Snapshot merge — review staging changes and apply or rollback
+# (defined early so both proxy-only and sandbox paths can use it)
+# ---------------------------------------------------------------------------
+snapshot_merge() {
+  [[ "$SNAPSHOT" != true ]] && return 0
+  [[ ! -d "$SNAPSHOT_STAGING" ]] && return 0
+
+  # Mark merge phase so cleanup preserves staging on signal (MED-7)
+  _SNAPSHOT_PHASE="merge"
+
+  # Compare staging (modified by sandbox) against original workdir
+  # Exclude the manifest file from diff
+  local _diff_summary
+  _diff_summary=$(diff -rq "$WORKDIR" "$SNAPSHOT_STAGING" --exclude='.claudebox-manifest' 2>/dev/null) || true
+
+  if [[ -z "$_diff_summary" ]]; then
+    echo ""
+    echo "✔ Snapshot: no changes detected — nothing to merge."
+    _SNAPSHOT_MERGED=true
+    rm -rf "$SNAPSHOT_STAGING" 2>/dev/null || true
+    return 0
+  fi
+
+  local change_count
+  change_count=$(echo "$_diff_summary" | wc -l)
+
+  # MED-4: detect concurrent modifications to original workdir
+  local _concurrent_warning=""
+  if [[ -f "$SNAPSHOT_STAGING/.claudebox-manifest" ]]; then
+    local _current_manifest
+    _current_manifest=$(find "$WORKDIR" -not -path "$SNAPSHOT_STAGING*" -printf '%P %T@ %s\n' 2>/dev/null | sort)
+    local _saved_manifest
+    _saved_manifest=$(cat "$SNAPSHOT_STAGING/.claudebox-manifest" 2>/dev/null)
+    if [[ "$_current_manifest" != "$_saved_manifest" ]]; then
+      _concurrent_warning="  ⚠ WARNING: Original workdir was modified while sandbox was running!
+    Applying changes may overwrite those modifications."
+    fi
+  fi
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  SNAPSHOT CHANGES ($change_count differences)"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  [[ -n "$_concurrent_warning" ]] && echo "$_concurrent_warning" && echo ""
+  echo "$_diff_summary" | head -30 | sed 's/^/  /'
+  [[ $change_count -gt 30 ]] && echo "  ... and $((change_count - 30)) more"
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  # Prompt user
+  while true; do
+    echo -n "  Apply changes to workdir? [y]es / [n]o (rollback) / [d]iff: "
+    read -r _answer </dev/tty || _answer="n"
+    case "$_answer" in
+      y|yes|Y|YES)
+        echo "  Applying changes..."
+        # Remove manifest before merge
+        rm -f "$SNAPSHOT_STAGING/.claudebox-manifest" 2>/dev/null || true
+        # MED-5: --hard-links preserves hardlinks; HIGH-4: check rsync exit code
+        if rsync -aH --delete "$SNAPSHOT_STAGING/" "$WORKDIR/"; then
+          echo "  ✔ Changes applied to $WORKDIR"
+          _SNAPSHOT_MERGED=true
+          rm -rf "$SNAPSHOT_STAGING" 2>/dev/null || true
+          notify snapshot_apply ":white_check_mark: Snapshot changes applied to \`$(basename "$WORKDIR")\` ($change_count differences)"
+        else
+          # HIGH-4: rsync failed — preserve staging for manual recovery
+          echo ""
+          echo "  ❌ rsync failed — workdir may be in an inconsistent state!"
+          echo "  Staging preserved for manual recovery:"
+          echo "    $SNAPSHOT_STAGING"
+          echo "  To retry:   rsync -aH --delete '$SNAPSHOT_STAGING/' '$WORKDIR/'"
+          echo "  To discard: rm -rf '$SNAPSHOT_STAGING'"
+          _SNAPSHOT_MERGED=true  # prevent cleanup from deleting staging
+          notify snapshot_error ":x: Snapshot merge failed — staging preserved at $SNAPSHOT_STAGING"
+        fi
+        return 0
+        ;;
+      n|no|N|NO)
+        echo "  ✔ Rollback — original workdir unchanged."
+        _SNAPSHOT_MERGED=true
+        rm -rf "$SNAPSHOT_STAGING" 2>/dev/null || true
+        notify snapshot_rollback ":rewind: Snapshot rolled back — \`$(basename "$WORKDIR")\` unchanged ($change_count changes discarded)"
+        return 0
+        ;;
+      d|diff|D|DIFF)
+        if command -v diff >/dev/null 2>&1; then
+          diff -ru "$WORKDIR" "$SNAPSHOT_STAGING" --exclude='.claudebox-manifest' 2>/dev/null | "${PAGER:-less}" || true
+        else
+          echo "  (diff not available)"
+        fi
+        ;;
+      *)
+        echo "  Please answer y, n, or d."
+        ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Proxy-only mode: no bwrap sandbox, credential proxy + direct execution.
+# Provides credential protection without namespace/cgroup isolation.
+# Project data is accessed directly (sync mode — no staging needed).
+# ---------------------------------------------------------------------------
+if [[ "$PROXY_ONLY" == true ]]; then
+  echo "▶ Proxy-only mode (no sandbox isolation)"
+
+  # Set up a temporary .claude directory with dummy credentials
+  _PROXY_ONLY_CLAUDE_DIR=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/claudebox-proxy-only-XXXXXX")
+  chmod 700 "$_PROXY_ONLY_CLAUDE_DIR"
+
+  # Copy relevant .claude files (settings, CLAUDE.md, etc.)
+  if [[ -d "$HOME/.claude" ]]; then
+    # Copy settings (not credentials)
+    for _f in settings.json settings.local.json CLAUDE.md; do
+      [[ -f "$HOME/.claude/$_f" ]] && cp "$HOME/.claude/$_f" "$_PROXY_ONLY_CLAUDE_DIR/"
+    done
+    # Copy projects directory for session resumption
+    if [[ "$SHARE_SESSIONS" == true && -d "$HOME/.claude/projects" ]]; then
+      cp -r "$HOME/.claude/projects" "$_PROXY_ONLY_CLAUDE_DIR/"
+    fi
+    # Copy history for --continue/--resume
+    [[ -f "$HOME/.claude/history.jsonl" ]] && cp "$HOME/.claude/history.jsonl" "$_PROXY_ONLY_CLAUDE_DIR/"
+  fi
+
+  # Place dummy credentials
+  cp "$TEMP_CREDS" "$_PROXY_ONLY_CLAUDE_DIR/.credentials.json"
+
+  # Build environment for the proxied command
+  _PROXY_ENV=(
+    ANTHROPIC_BASE_URL="http://127.0.0.1:$HOST_PORT_ANTHROPIC"
+    CLAUDE_CONFIG_DIR="$_PROXY_ONLY_CLAUDE_DIR"
+    NO_PROXY="127.0.0.1,localhost,::1"
+    HTTP_PROXY=""
+    ALL_PROXY=""
+  )
+
+  # GitHub CONNECT proxy for additional HTTPS hosts
+  if [[ "$ENABLE_GITHUB" == true || ${#ALLOWLIST_URLS[@]} -gt 0 ]]; then
+    _PROXY_ENV+=(HTTPS_PROXY="http://127.0.0.1:$HOST_PORT_GITHUB_CONNECT")
+  fi
+
+  # OpenAI service proxy
+  if [[ "$_HAS_OPENAI" == true ]]; then
+    _PROXY_ENV+=(
+      OPENAI_BASE_URL="http://127.0.0.1:$HOST_PORT_OPENAI"
+      OPENAI_API_KEY="$SESSION_DUMMY_TOKEN"
+    )
+    echo "  OpenAI proxy: http://127.0.0.1:$HOST_PORT_OPENAI"
+  fi
+
+  # GitHub MCP: write settings.local.json with MCP config
+  if [[ "$ENABLE_GITHUB_MCP" == true ]]; then
+    cat > "$_PROXY_ONLY_CLAUDE_DIR/settings.local.json" <<MCPEOF
+{
+  "mcpServers": {
+    "github": {
+      "type": "url",
+      "url": "http://127.0.0.1:${HOST_PORT_MCP_SERVER}/mcp",
+      "headers": {
+        "Authorization": "Bearer ${SESSION_DUMMY_TOKEN}"
+      }
+    }
+  }
+}
+MCPEOF
+    echo "  GitHub MCP: http://127.0.0.1:$HOST_PORT_MCP_SERVER"
+  fi
+
+  NET_DESC="host network (proxy-only)"
+  if [[ "$SNAPSHOT" == true ]]; then _rw_desc="snapshot"
+  elif [[ "$READONLY_WORKDIR" == true ]]; then _rw_desc="read-only"
+  else _rw_desc="read-write"; fi
+  echo "  Workdir: $WORKDIR [$_rw_desc]"
+  echo "  Anthropic proxy: http://127.0.0.1:$HOST_PORT_ANTHROPIC"
+  echo "  Config dir: $_PROXY_ONLY_CLAUDE_DIR"
+  notify sandbox_start ":rocket: Proxy-only started — workdir: \`$(basename "$WORKDIR")\` [$_rw_desc], PID: $$"
+
+  # Handle snapshot mode in proxy-only (copy workdir, run there, merge back)
+  _PROXY_WORKDIR="$WORKDIR"
+  if [[ "$SNAPSHOT" == true && -n "$SNAPSHOT_STAGING" ]]; then
+    _PROXY_WORKDIR="$SNAPSHOT_STAGING"
+  fi
+
+  # Launch the command
+  PROXY_ONLY_EXIT=0
+  if [[ "$LAUNCH_SHELL" == true ]]; then
+    echo "  Exit the shell with Ctrl-D or 'exit'"
+    (cd "$_PROXY_WORKDIR" && env "${_PROXY_ENV[@]}" bash) || PROXY_ONLY_EXIT=$?
+  else
+    echo "  Ctrl-C terminates the process"
+    (cd "$_PROXY_WORKDIR" && env "${_PROXY_ENV[@]}" claude "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}") || PROXY_ONLY_EXIT=$?
+  fi
+
+  # Post-exit: diff, quarantine, snapshot merge
+  diff_on_exit
+  quarantine_scan
+  snapshot_merge
+
+  # Sync session data back
+  if [[ "$SHARE_SESSIONS" == true && -d "$_PROXY_ONLY_CLAUDE_DIR/projects" ]]; then
+    mkdir -p "$HOME/.claude/projects"
+    cp -r "$_PROXY_ONLY_CLAUDE_DIR/projects/." "$HOME/.claude/projects/" 2>/dev/null || true
+    echo "✔ Session data synced back"
+  fi
+
+  rm -rf "$_PROXY_ONLY_CLAUDE_DIR" 2>/dev/null || true
+  notify sandbox_exit ":stop_sign: Proxy-only exited (code: $PROXY_ONLY_EXIT, workdir: \`$(basename "$WORKDIR")\`)"
+  exit "$PROXY_ONLY_EXIT"
+fi
 
 # ---------------------------------------------------------------------------
 # Build bwrap command
@@ -1162,6 +1517,18 @@ if [[ "$ENABLE_GITHUB_MCP" == true ]]; then
     --setenv _MCP_PORT "$PORT_MCP"
     --setenv _ENABLE_GITHUB_MCP "true"
     --setenv _MCP_DUMMY_TOKEN "$SESSION_DUMMY_TOKEN"
+  )
+fi
+
+# OpenAI service proxy: bind-mount socket and set env vars
+if [[ "$_HAS_OPENAI" == true ]]; then
+  BWRAP+=(
+    --ro-bind "$SOCKET_OPENAI" "$SANDBOX_SOCKET_OPENAI"
+    --setenv OPENAI_BASE_URL "http://127.0.0.1:$PORT_OPENAI"
+    --setenv OPENAI_API_KEY "$SESSION_DUMMY_TOKEN"
+    --setenv _OPENAI_SOCK "$SANDBOX_SOCKET_OPENAI"
+    --setenv _OPENAI_PORT "$PORT_OPENAI"
+    --setenv _HAS_OPENAI "true"
   )
 fi
 
@@ -1699,6 +2066,22 @@ SANDBOX_INIT_SCRIPT='
     fi
   fi
 
+  # OpenAI bridge (when --proxy-service openai is used)
+  if [[ "${_HAS_OPENAI:-}" == true && "$_ISOLATE_NET" == true ]]; then
+    if command -v node >/dev/null 2>&1 && [[ -f /run/credential-proxy.js ]]; then
+      node /run/credential-proxy.js --bridge-only \
+        --socket "$_OPENAI_SOCK" --tcp-bridge-port "$_OPENAI_PORT" &
+      for _i in $(seq 1 20); do
+        (echo >/dev/tcp/127.0.0.1/"$_OPENAI_PORT") 2>/dev/null && break || true
+        sleep 0.1
+      done
+    elif command -v socat >/dev/null 2>&1; then
+      socat TCP-LISTEN:"$_OPENAI_PORT",fork,reuseaddr UNIX-CLIENT:"$_OPENAI_SOCK" &
+      sleep 0.3
+    fi
+    echo "✔ OpenAI proxy bridge ready (port $_OPENAI_PORT)"
+  fi
+
   # Start attach shell listener (socat) for external access via --attach
   # MED-7: enforce restrictive permissions on attach socket directory.
   if command -v socat >/dev/null 2>&1; then
@@ -1762,7 +2145,7 @@ MCPEOF
 
   # Save _LAUNCH_SHELL before cleaning up internal init vars.
   _ls="$_LAUNCH_SHELL"
-  unset _PROXY_SOCK _PROXY_PORT _GITHUB_SOCK _GITHUB_PORT _ISOLATE_NET _ENABLE_GITHUB _LAUNCH_SHELL _SHARE_SESSIONS _ENABLE_GITHUB_MCP _MCP_SOCK _MCP_PORT _MCP_DUMMY_TOKEN _ENABLE_SLACK _SLACK_SOCK _SLACK_PORT
+  unset _PROXY_SOCK _PROXY_PORT _GITHUB_SOCK _GITHUB_PORT _ISOLATE_NET _ENABLE_GITHUB _LAUNCH_SHELL _SHARE_SESSIONS _ENABLE_GITHUB_MCP _MCP_SOCK _MCP_PORT _MCP_DUMMY_TOKEN _HAS_OPENAI _OPENAI_SOCK _OPENAI_PORT _ENABLE_SLACK _SLACK_SOCK _SLACK_PORT
 
   if [[ "$_ls" == true ]]; then
     exec bash
@@ -1799,189 +2182,6 @@ timeout_check() {
     echo "⚠ SANDBOX TIMED OUT — wall-clock limit (${WALL_TIMEOUT}m) reached"
     notify wall_timeout ":alarm_clock: Sandbox timed out — wall-clock limit (${WALL_TIMEOUT}m) reached (workdir: \`$(basename "$WORKDIR")\`)"
   fi
-}
-
-# ---------------------------------------------------------------------------
-# Diff-on-exit: show git diff --stat if workdir is a git repo
-# ---------------------------------------------------------------------------
-diff_on_exit() {
-  # Skip for snapshot mode (snapshot_merge handles its own diff)
-  [[ "$SNAPSHOT" == true ]] && return 0
-  # Skip for read-only workdir (no changes possible)
-  [[ "$READONLY_WORKDIR" == true ]] && return 0
-
-  # Only if workdir is a git repo
-  if [[ -d "$WORKDIR/.git" ]] || git -C "$WORKDIR" rev-parse --git-dir &>/dev/null; then
-    local _stat
-    _stat=$(git -C "$WORKDIR" diff --stat 2>/dev/null) || true
-    local _untracked
-    _untracked=$(git -C "$WORKDIR" ls-files --others --exclude-standard 2>/dev/null | head -20) || true
-
-    if [[ -n "$_stat" || -n "$_untracked" ]]; then
-      echo ""
-      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-      echo "  WORKDIR CHANGES"
-      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-      if [[ -n "$_stat" ]]; then
-        echo "$_stat" | sed 's/^/  /'
-      fi
-      if [[ -n "$_untracked" ]]; then
-        local _ucount
-        _ucount=$(git -C "$WORKDIR" ls-files --others --exclude-standard 2>/dev/null | wc -l)
-        echo ""
-        echo "  Untracked files ($((${_ucount}))):"
-        echo "$_untracked" | sed 's/^/    /'
-        [[ $_ucount -gt 20 ]] && echo "    ... and $((_ucount - 20)) more"
-      fi
-      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    fi
-  fi
-}
-
-# ---------------------------------------------------------------------------
-# Filesystem quarantine: scan modified/created files for suspicious patterns
-# ---------------------------------------------------------------------------
-quarantine_scan() {
-  # Skip for read-only workdir
-  [[ "$READONLY_WORKDIR" == true ]] && return 0
-
-  local scan_dir="$WORKDIR"
-  # For snapshot mode, scan the staging directory
-  [[ "$SNAPSHOT" == true && -d "$SNAPSHOT_STAGING" ]] && scan_dir="$SNAPSHOT_STAGING"
-
-  local warnings=()
-
-  # Check for shell scripts with network commands (potential exfiltration)
-  while IFS= read -r -d '' _f; do
-    local _rel="${_f#"$scan_dir"/}"
-    [[ "$_rel" == .git/* || "$_rel" == node_modules/* ]] && continue
-    if grep -lqE '(curl|wget|nc |ncat|socat)\s' "$_f" 2>/dev/null; then
-      warnings+=("  ⚠ Script with network commands: $_rel")
-    fi
-  done < <(find "$scan_dir" -maxdepth 5 -type f \( -name '*.sh' -o -name '*.bash' \) -print0 2>/dev/null)
-
-  # Check for modified dotfiles (potential persistence)
-  while IFS= read -r -d '' _f; do
-    local _rel="${_f#"$scan_dir"/}"
-    warnings+=("  ⚠ Dotfile present: $_rel")
-  done < <(find "$scan_dir" -maxdepth 2 -type f \( -name '.bashrc' -o -name '.bash_profile' -o -name '.profile' -o -name '.zshrc' \) -print0 2>/dev/null)
-
-  # Check for potential encoded secrets (long base64 strings in text files)
-  while IFS= read -r -d '' _f; do
-    local _rel="${_f#"$scan_dir"/}"
-    [[ "$_rel" == .git/* || "$_rel" == node_modules/* || "$_rel" == *.png || "$_rel" == *.jpg || "$_rel" == *.gz || "$_rel" == *.o ]] && continue
-    if grep -qP '[A-Za-z0-9+/]{80,}={0,2}' "$_f" 2>/dev/null; then
-      warnings+=("  ⚠ Possible encoded secret: $_rel")
-    fi
-  done < <(find "$scan_dir" -maxdepth 5 -type f -size -1M -print0 2>/dev/null | head -z -n 100)
-
-  if [[ ${#warnings[@]} -gt 0 ]]; then
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  QUARANTINE SCAN (${#warnings[@]} findings)"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    printf '%s\n' "${warnings[@]}"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    notify quarantine_warning ":warning: Quarantine scan found ${#warnings[@]} suspicious items in \`$(basename "$WORKDIR")\`"
-  fi
-}
-
-# ---------------------------------------------------------------------------
-# Snapshot merge — review staging changes and apply or rollback
-# ---------------------------------------------------------------------------
-snapshot_merge() {
-  [[ "$SNAPSHOT" != true ]] && return 0
-  [[ ! -d "$SNAPSHOT_STAGING" ]] && return 0
-
-  # Mark merge phase so cleanup preserves staging on signal (MED-7)
-  _SNAPSHOT_PHASE="merge"
-
-  # Compare staging (modified by sandbox) against original workdir
-  # Exclude the manifest file from diff
-  local _diff_summary
-  _diff_summary=$(diff -rq "$WORKDIR" "$SNAPSHOT_STAGING" --exclude='.claudebox-manifest' 2>/dev/null) || true
-
-  if [[ -z "$_diff_summary" ]]; then
-    echo ""
-    echo "✔ Snapshot: no changes detected — nothing to merge."
-    _SNAPSHOT_MERGED=true
-    rm -rf "$SNAPSHOT_STAGING" 2>/dev/null || true
-    return 0
-  fi
-
-  local change_count
-  change_count=$(echo "$_diff_summary" | wc -l)
-
-  # MED-4: detect concurrent modifications to original workdir
-  local _concurrent_warning=""
-  if [[ -f "$SNAPSHOT_STAGING/.claudebox-manifest" ]]; then
-    local _current_manifest
-    _current_manifest=$(find "$WORKDIR" -not -path "$SNAPSHOT_STAGING*" -printf '%P %T@ %s\n' 2>/dev/null | sort)
-    local _saved_manifest
-    _saved_manifest=$(cat "$SNAPSHOT_STAGING/.claudebox-manifest" 2>/dev/null)
-    if [[ "$_current_manifest" != "$_saved_manifest" ]]; then
-      _concurrent_warning="  ⚠ WARNING: Original workdir was modified while sandbox was running!
-    Applying changes may overwrite those modifications."
-    fi
-  fi
-
-  echo ""
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "  SNAPSHOT CHANGES ($change_count differences)"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  [[ -n "$_concurrent_warning" ]] && echo "$_concurrent_warning" && echo ""
-  echo "$_diff_summary" | head -30 | sed 's/^/  /'
-  [[ $change_count -gt 30 ]] && echo "  ... and $((change_count - 30)) more"
-  echo ""
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-  # Prompt user
-  while true; do
-    echo -n "  Apply changes to workdir? [y]es / [n]o (rollback) / [d]iff: "
-    read -r _answer </dev/tty || _answer="n"
-    case "$_answer" in
-      y|yes|Y|YES)
-        echo "  Applying changes..."
-        # Remove manifest before merge
-        rm -f "$SNAPSHOT_STAGING/.claudebox-manifest" 2>/dev/null || true
-        # MED-5: --hard-links preserves hardlinks; HIGH-4: check rsync exit code
-        if rsync -aH --delete "$SNAPSHOT_STAGING/" "$WORKDIR/"; then
-          echo "  ✔ Changes applied to $WORKDIR"
-          _SNAPSHOT_MERGED=true
-          rm -rf "$SNAPSHOT_STAGING" 2>/dev/null || true
-          notify snapshot_apply ":white_check_mark: Snapshot changes applied to \`$(basename "$WORKDIR")\` ($change_count differences)"
-        else
-          # HIGH-4: rsync failed — preserve staging for manual recovery
-          echo ""
-          echo "  ❌ rsync failed — workdir may be in an inconsistent state!"
-          echo "  Staging preserved for manual recovery:"
-          echo "    $SNAPSHOT_STAGING"
-          echo "  To retry:   rsync -aH --delete '$SNAPSHOT_STAGING/' '$WORKDIR/'"
-          echo "  To discard: rm -rf '$SNAPSHOT_STAGING'"
-          _SNAPSHOT_MERGED=true  # prevent cleanup from deleting staging
-          notify snapshot_error ":x: Snapshot merge failed — staging preserved at $SNAPSHOT_STAGING"
-        fi
-        return 0
-        ;;
-      n|no|N|NO)
-        echo "  ✔ Rollback — original workdir unchanged."
-        _SNAPSHOT_MERGED=true
-        rm -rf "$SNAPSHOT_STAGING" 2>/dev/null || true
-        notify snapshot_rollback ":rewind: Snapshot rolled back — \`$(basename "$WORKDIR")\` unchanged ($change_count changes discarded)"
-        return 0
-        ;;
-      d|diff|D|DIFF)
-        if command -v diff >/dev/null 2>&1; then
-          diff -ru "$WORKDIR" "$SNAPSHOT_STAGING" --exclude='.claudebox-manifest' 2>/dev/null | "${PAGER:-less}" || true
-        else
-          echo "  (diff not available)"
-        fi
-        ;;
-      *)
-        echo "  Please answer y, n, or d."
-        ;;
-    esac
-  done
 }
 
 if [[ "$LAUNCH_SHELL" == true ]]; then

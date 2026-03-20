@@ -2,7 +2,9 @@
 
 Run [Claude Code](https://docs.anthropic.com/en/docs/claude-code) in a [bubblewrap](https://github.com/containers/bubblewrap) sandbox with a host-side credential proxy.
 
-Real API credentials stay on the host. The sandbox only sees dummy tokens, which the host-side proxy replaces with real ones before forwarding to Anthropic. The sandbox process never sees real credentials.
+Real API credentials stay on the host. The sandbox only sees dummy tokens, which the host-side proxy replaces with real ones before forwarding to upstream APIs. The sandbox process never sees real credentials.
+
+Supports multiple LLM services via presets (Anthropic, OpenAI, etc.) and a proxy-only mode for credential protection without full sandboxing.
 
 ## Architecture
 
@@ -12,6 +14,9 @@ Host                                              External APIs
 │  credential-proxy.js                 │         │ api.anthropic.com│
 │  ├─ Anthropic proxy (Unix socket)    │────────>│                  │
 │  │  dummy token → real token         │         └──────────────────┘
+│  ├─ OpenAI proxy (Unix socket)       │────────>┌──────────────────┐
+│  │  (--proxy-service openai)         │         │ api.openai.com   │
+│  │                                   │         └──────────────────┘
 │  ├─ GitHub CONNECT proxy (Unix sock) │────────>┌──────────────────┐
 │  └─ MCP reverse bridge (Unix sock)   │──┐      │ api.github.com   │
 │                                      │  │      │ (CONNECT tunnel) │
@@ -106,6 +111,18 @@ GH_TOKEN=ghp_xxx ./claudebox.sh --enable-github
 # Preview the sandbox command without running it
 ./claudebox.sh --dry-run --workdir ~/projects/myapp
 
+# Multi-service: proxy OpenAI API alongside Anthropic
+OPENAI_API_KEY=sk-xxx ./claudebox.sh --proxy-service openai
+
+# Proxy-only mode: credential protection without sandbox isolation
+./claudebox.sh --proxy-only
+
+# Proxy-only with OpenAI + Anthropic
+OPENAI_API_KEY=sk-xxx ./claudebox.sh --proxy-only --proxy-service openai
+
+# Proxy-only with shell (for other LLM tools)
+OPENAI_API_KEY=sk-xxx ./claudebox.sh --proxy-only --proxy-service openai --shell
+
 # Full example
 ./claudebox.sh \
   --workdir ~/projects/myapp \
@@ -155,11 +172,65 @@ GH_TOKEN=ghp_xxx ./claudebox.sh --enable-github
 --seccomp              Enable seccomp filter blocking dangerous syscalls (ptrace, mount, etc.)
 --profile NAME         Load options from ~/.config/claudebox/profiles/NAME.conf.
 --image DIR            Use extracted container rootfs as base filesystem instead of host /usr.
+--proxy-only           Proxy-only mode: no bwrap sandbox or cgroups. Runs the credential
+                       proxy and launches the command directly. Provides credential
+                       protection without full isolation (sync mode for project data).
+--proxy-service NAME   Enable credential proxy for additional LLM services. Repeatable.
+                       Available presets: anthropic (default, always on), openai.
+                       e.g. --proxy-service openai
+--openai-port PORT     TCP port for OpenAI proxy bridge (default: 58083).
 --dry-run              Print the full bwrap command without executing it.
 --anthropic-port PORT  TCP port for Anthropic proxy bridge (default: 58080).
 --github-port PORT     TCP port for GitHub CONNECT proxy bridge (default: 58081).
 --help                 Show help.
 ```
+
+## Multi-Service Proxy
+
+The credential proxy supports multiple LLM service presets. Each service gets its own
+Unix socket and TCP bridge, with service-specific credential retrieval and path allowlists.
+
+**Built-in presets:**
+
+| Service | Upstream | Auth | Credential Source | Port |
+|---------|----------|------|-------------------|------|
+| `anthropic` | api.anthropic.com | OAuth / x-api-key | CLAUDE_CREDENTIALS_FILE, keychain, ~/.claude/.credentials.json | 58080 |
+| `openai` | api.openai.com | Bearer token | OPENAI_API_KEY, OPENAI_CREDENTIALS_FILE, ~/.config/claudebox/openai-key | 58083 |
+
+```bash
+# Enable OpenAI proxy alongside default Anthropic
+OPENAI_API_KEY=sk-xxx ./claudebox.sh --proxy-service openai
+
+# Inside sandbox, tools see:
+#   ANTHROPIC_BASE_URL=http://127.0.0.1:58080
+#   OPENAI_BASE_URL=http://127.0.0.1:58083
+#   OPENAI_API_KEY=<dummy-token>  (replaced by proxy with real key)
+```
+
+## Proxy-Only Mode
+
+`--proxy-only` provides credential protection without namespace/cgroup isolation.
+The credential proxy runs on the host and the command is launched directly with
+environment variables pointing to the proxy. No bwrap or systemd-run is used.
+
+This is useful for:
+- Machines where bwrap is unavailable
+- Running other LLM tools (not just Claude Code) with credential protection
+- Development workflows where full sandboxing is unnecessary
+
+```bash
+# Proxy-only with shell — run any LLM tool with proxied credentials
+OPENAI_API_KEY=sk-xxx ./claudebox.sh --proxy-only --proxy-service openai --shell
+
+# Inside the shell:
+#   ANTHROPIC_BASE_URL=http://127.0.0.1:58080
+#   OPENAI_BASE_URL=http://127.0.0.1:58083
+#   OPENAI_API_KEY=<dummy>  (real key never visible to child process)
+```
+
+Project data is accessed directly (sync mode): the working directory is used as-is,
+and session data is synced back on exit when `--share-sessions` is used. `--snapshot`
+mode is also supported for proxy-only (creates a staging copy, merges back on exit).
 
 ## Network Isolation
 
