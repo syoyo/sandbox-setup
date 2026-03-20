@@ -204,6 +204,8 @@ function parseArgs(argv) {
     mcpBridgeSocket:   null,   // Unix socket for MCP auth proxy
     mcpBridgePort:     null,   // target TCP port of MCP server on localhost
     mcpBearerToken:    process.env.MCP_BEARER_TOKEN || null,   // Bearer token from env (not CLI)
+    slackWebhook:      process.env.SLACK_WEBHOOK_URL || null,   // Slack webhook URL (env preferred over CLI)
+    slackSocket:       null,   // Unix socket for Slack webhook proxy
     bridgeOnly:        false,
     bridgeSocket:      null,
     bridgeTcpPort:     null,
@@ -233,6 +235,9 @@ function parseArgs(argv) {
       case '--audit-log':           args.auditLog = argv[++i]; break;
       case '--connect-allowlist':   args.connectAllowlist.push(argv[++i]); break;
       case '--enable-github':       args.enableGithub = true; break;
+      // HIGH-3: prefer SLACK_WEBHOOK_URL env var over CLI to avoid /proc/PID/cmdline leak.
+      case '--slack-webhook':       args.slackWebhook = argv[++i]; break;
+      case '--slack-socket':        args.slackSocket  = argv[++i]; break;
       case '--bridge-only':         args.bridgeOnly = true; break;
       case '--socket':              args.bridgeSocket  = argv[++i]; break;
       case '--tcp-bridge-port':     args.bridgeTcpPort = parseInt(argv[++i], 10); break;
@@ -1249,6 +1254,150 @@ function startGenericServiceProxy(presetName, socketPath, tcpPort, dummyToken, v
 }
 
 // ---------------------------------------------------------------------------
+// Slack webhook proxy: accepts POST from sandbox, forwards to real webhook URL
+// The webhook URL never enters the sandbox — same pattern as credential proxy.
+// ---------------------------------------------------------------------------
+
+// Maximum response body from Slack webhook (prevent OOM from malicious upstream).
+const MAX_SLACK_RESPONSE = 1 * 1024 * 1024; // 1 MB
+// Upstream request timeout for Slack webhook (prevent hung connections).
+const SLACK_UPSTREAM_TIMEOUT = 15_000; // 15 seconds
+
+function startSlackWebhookProxy(socketPath, webhookUrl, verbose) {
+  const tag = '[slack-proxy]';
+  if (fs.existsSync(socketPath)) fs.unlinkSync(socketPath);
+
+  // Pre-parse and validate the webhook URL once at startup.
+  const wh = new URL(webhookUrl);
+  if (wh.protocol !== 'https:') {
+    console.error(`${tag} Only https webhooks allowed (got ${wh.protocol})`);
+    process.exit(1);
+  }
+
+  const server = http.createServer((req, res) => {
+    if (req.method !== 'POST') {
+      res.writeHead(405);
+      res.end('Method not allowed');
+      return;
+    }
+
+    let bodyLen = 0;
+    let aborted = false;
+    const chunks = [];
+
+    req.on('data', (c) => {
+      if (aborted) return;
+      bodyLen += c.length;
+      // Limit body to 1 MB (Slack payloads are tiny; prevents abuse).
+      if (bodyLen > 1 * 1024 * 1024) {
+        aborted = true;
+        req.destroy();
+        if (!res.headersSent) { res.writeHead(413); res.end('Request body too large'); }
+        return;
+      }
+      chunks.push(c);
+    });
+
+    req.on('end', () => {
+      if (aborted) return;
+      const body = Buffer.concat(chunks);
+
+      // Validate JSON (Slack expects application/json).
+      try {
+        JSON.parse(body.toString());
+      } catch (_) {
+        res.writeHead(400);
+        res.end('Invalid JSON');
+        return;
+      }
+
+      if (verbose) console.log(`${tag} forwarding ${body.length} bytes to ${wh.hostname}`);
+
+      // DNS rebinding check (same as notification webhook).
+      const dns = require('dns');
+      dns.lookup(wh.hostname, (err, address) => {
+        if (err) {
+          console.warn(`${tag} DNS lookup failed: ${err.message}`);
+          res.writeHead(502);
+          res.end('DNS lookup failed');
+          return;
+        }
+        if (isPrivateIP(address)) {
+          console.warn(`${tag} rejected: ${wh.hostname} resolved to private address ${address}`);
+          res.writeHead(403);
+          res.end('Private address not allowed');
+          return;
+        }
+
+        // SEC: construct headers from scratch — do NOT forward sandbox request
+        // headers to prevent header injection / request smuggling.
+        const reqOpts = {
+          hostname: address,
+          port: wh.port || 443,
+          path: wh.pathname + wh.search,
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': body.length,
+            'Host': wh.host,
+          },
+          timeout: SLACK_UPSTREAM_TIMEOUT,
+        };
+
+        const proxyReq = https.request(reqOpts, (proxyRes) => {
+          let respLen = 0;
+          const respChunks = [];
+          proxyRes.on('data', (c) => {
+            respLen += c.length;
+            if (respLen > MAX_SLACK_RESPONSE) {
+              proxyReq.destroy();
+              if (!res.headersSent) { res.writeHead(502); res.end('Upstream response too large'); }
+              return;
+            }
+            respChunks.push(c);
+          });
+          proxyRes.on('end', () => {
+            if (res.headersSent) return;
+            const respBody = Buffer.concat(respChunks).toString();
+            // SEC: only return status + plain text body — do NOT forward
+            // upstream response headers (Set-Cookie, Location, etc.) to sandbox.
+            res.writeHead(proxyRes.statusCode, { 'Content-Type': 'text/plain' });
+            res.end(respBody);
+            if (verbose) console.log(`${tag} Slack responded: ${proxyRes.statusCode} ${respBody.slice(0, 100)}`);
+          });
+        });
+
+        proxyReq.on('timeout', () => {
+          console.warn(`${tag} upstream timeout (${SLACK_UPSTREAM_TIMEOUT}ms)`);
+          proxyReq.destroy();
+          if (!res.headersSent) { res.writeHead(504); res.end('Upstream timeout'); }
+        });
+
+        proxyReq.on('error', (e) => {
+          console.warn(`${tag} upstream error: ${e.message}`);
+          if (!res.headersSent) { res.writeHead(502); res.end('Upstream error'); }
+        });
+
+        proxyReq.write(body);
+        proxyReq.end();
+      });
+    });
+  });
+
+  server.maxConnections = MAX_CONNECTIONS;
+  server.requestTimeout = 30_000;
+  server.headersTimeout = 10_000;
+  server.listen(socketPath, () => {
+    console.log(`${tag} Slack webhook proxy socket: ${socketPath}`);
+  });
+  server.on('error', (err) => {
+    console.error(`${tag} socket error: ${err.message}`);
+    process.exit(1);
+  });
+  return server;
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1321,6 +1470,13 @@ if (args.bridgeOnly) {
     startMcpAuthProxy(args.mcpBridgePort, mcpBridgeSocketPath, args.mcpBearerToken);
   }
 
+  // Slack webhook proxy (forward sandbox POSTs to real Slack webhook URL)
+  let slackSocketPath = null;
+  if (args.slackWebhook && args.slackSocket) {
+    slackSocketPath = args.slackSocket;
+    startSlackWebhookProxy(slackSocketPath, args.slackWebhook, args.verbose);
+  }
+
   const cleanup = () => {
     // Log final token summary
     const s = getTokenSummary();
@@ -1335,6 +1491,7 @@ if (args.bridgeOnly) {
     for (const svc of _serviceProxies) {
       try { fs.unlinkSync(svc.socketPath); } catch (_) {}
     }
+    if (slackSocketPath) { try { fs.unlinkSync(slackSocketPath); } catch (_) {} }
     process.exit(0);
   };
   process.on('SIGINT', cleanup);
