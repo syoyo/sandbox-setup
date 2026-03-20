@@ -99,7 +99,7 @@ function parseArgs(argv) {
     auditLog:          null,    // path to audit log file
     notifyCommand:     null,
     notifyWebhook:     null,
-    autoRefreshAuth:   false,
+    autoRefreshAuth:   true,
     mcpBridgeSocket:   null,   // Unix socket for MCP auth proxy
     mcpBridgePort:     null,   // target TCP port of MCP server on localhost
     mcpBearerToken:    process.env.MCP_BEARER_TOKEN || null,   // Bearer token from env (not CLI)
@@ -121,6 +121,7 @@ function parseArgs(argv) {
       case '--notify-command':     args.notifyCommand = argv[++i]; break;
       case '--notify-webhook':     args.notifyWebhook = argv[++i]; break;
       case '--auto-refresh-auth':  args.autoRefreshAuth = true; break;
+      case '--no-auto-refresh-auth': args.autoRefreshAuth = false; break;
       case '--mcp-bridge-socket':  args.mcpBridgeSocket = argv[++i]; break;
       case '--mcp-bridge-port':    args.mcpBridgePort = parseInt(argv[++i], 10); break;
       // HIGH-3: bearer token read from MCP_BEARER_TOKEN env var (not CLI) to avoid /proc leak.
@@ -159,7 +160,8 @@ PROXY MODE (host side — claudebox.sh manages this automatically):
     --anthropic-tcp-port PORT   Host-side TCP bridge (default: ${DEFAULT_ANTHROPIC_PORT})
     --github-connect-port PORT  HTTPS CONNECT proxy port (default: ${DEFAULT_GITHUB_CONNECT_PORT})
     --enable-github             Add api.github.com to CONNECT allowlist
-    --auto-refresh-auth         Run a short host \`claude -p ...\` probe on 401, then retry once if the token changed
+    --auto-refresh-auth         Auto-refresh expired OAuth tokens (default: enabled)
+    --no-auto-refresh-auth      Disable automatic OAuth token refresh
     --verbose
 
 BRIDGE-ONLY MODE (in-sandbox, for --no-network):
@@ -232,6 +234,136 @@ function getAccessToken() {
 
 function invalidateCache() { _credsCache = null; }
 
+function getRefreshToken() {
+  const creds = getClaudeCredentials();
+  return creds?.claudeAiOauth?.refreshToken ?? null;
+}
+
+function getTokenExpiresAt() {
+  const creds = getClaudeCredentials();
+  return creds?.claudeAiOauth?.expiresAt ?? null;
+}
+
+function isTokenExpiredOrExpiring() {
+  const expiresAt = getTokenExpiresAt();
+  if (!expiresAt) return false;
+  // Consider expired if within 2 minutes of expiry
+  return Date.now() >= expiresAt - 120_000;
+}
+
+// ---------------------------------------------------------------------------
+// Direct OAuth token refresh using refresh_token grant
+// ---------------------------------------------------------------------------
+
+const OAUTH_TOKEN_URL = 'https://console.anthropic.com/api/oauth/token';
+const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+
+function refreshTokenDirectly(verbose) {
+  return new Promise((resolve) => {
+    const refreshToken = getRefreshToken();
+    if (!refreshToken) {
+      if (verbose) console.log('[auth] no refresh token available for direct refresh');
+      resolve(false);
+      return;
+    }
+
+    const payload = JSON.stringify({
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      client_id: OAUTH_CLIENT_ID,
+    });
+
+    const u = new URL(OAUTH_TOKEN_URL);
+    const opts = {
+      hostname: u.hostname,
+      port: 443,
+      path: u.pathname,
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(payload),
+      },
+    };
+
+    if (verbose) console.log('[auth] attempting direct OAuth token refresh');
+
+    const req = https.request(opts, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const body = Buffer.concat(chunks).toString('utf8');
+        if (res.statusCode !== 200) {
+          console.warn(`[auth] direct refresh failed: HTTP ${res.statusCode}: ${body.slice(0, 200)}`);
+          resolve(false);
+          return;
+        }
+        try {
+          const data = JSON.parse(body);
+          const newAccessToken = data.access_token;
+          const newRefreshToken = data.refresh_token;
+          const expiresIn = data.expires_in; // seconds
+
+          if (!newAccessToken) {
+            console.warn('[auth] direct refresh: no access_token in response');
+            resolve(false);
+            return;
+          }
+
+          // Update credentials file on disk
+          const updated = updateCredentialsFile(newAccessToken, newRefreshToken, expiresIn);
+          if (updated) {
+            invalidateCache();
+            if (verbose) console.log('[auth] direct refresh succeeded, credentials updated');
+            resolve(true);
+          } else {
+            console.warn('[auth] direct refresh: failed to write updated credentials');
+            resolve(false);
+          }
+        } catch (e) {
+          console.warn('[auth] direct refresh: failed to parse response:', e.message);
+          resolve(false);
+        }
+      });
+    });
+
+    req.on('error', (err) => {
+      console.warn('[auth] direct refresh request error:', err.message);
+      resolve(false);
+    });
+
+    req.write(payload);
+    req.end();
+  });
+}
+
+function updateCredentialsFile(newAccessToken, newRefreshToken, expiresIn) {
+  // Find the credentials file that was used
+  const credPaths = [];
+  const envFile = process.env.CLAUDE_CREDENTIALS_FILE;
+  if (envFile) credPaths.push(envFile);
+  credPaths.push(
+    path.join(os.homedir(), '.claude', '.credentials.json'),
+    path.join(os.homedir(), '.config', 'claude', 'auth.json'),
+  );
+
+  for (const p of credPaths) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      const creds = JSON.parse(fs.readFileSync(p, 'utf8'));
+      if (creds?.claudeAiOauth) {
+        creds.claudeAiOauth.accessToken = newAccessToken;
+        if (newRefreshToken) creds.claudeAiOauth.refreshToken = newRefreshToken;
+        if (expiresIn) {
+          creds.claudeAiOauth.expiresAt = Date.now() + expiresIn * 1000;
+        }
+        fs.writeFileSync(p, JSON.stringify(creds, null, 2), 'utf8');
+        return true;
+      }
+    } catch (_) {}
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Idle tracking — updated on every Anthropic API request
 // ---------------------------------------------------------------------------
@@ -300,24 +432,34 @@ function isExpiredOauthResponse(statusCode, bodyText) {
 
 async function refreshHostAuth(verbose) {
   if (_authRefreshPromise) return _authRefreshPromise;
-  _authRefreshPromise = new Promise((resolve) => {
+  _authRefreshPromise = (async () => {
+    console.warn('[auth] Attempting token refresh');
+
+    // Strategy 1: Direct OAuth refresh using refresh_token grant
+    const directOk = await refreshTokenDirectly(verbose);
+    if (directOk) return true;
+
+    // Strategy 2: Fall back to spawning host Claude to trigger its internal refresh
+    console.warn('[auth] Direct refresh failed; falling back to host Claude probe');
     const previousToken = getAccessToken();
-    console.warn('[auth] Received 401; probing host Claude to trigger token refresh');
-    const child = spawn('claude', ['-p', 'hi claude, may you be happy'], {
-      stdio: 'ignore',
-      env: process.env,
+    const probeOk = await new Promise((resolve) => {
+      const child = spawn('claude', ['-p', 'hi claude, may you be happy'], {
+        stdio: 'ignore',
+        env: process.env,
+      });
+      child.on('error', (err) => {
+        console.error('[auth] refresh command failed:', err.message);
+        resolve(false);
+      });
+      child.on('exit', (code) => {
+        if (verbose) console.log(`[auth] refresh command exited with ${code}`);
+        invalidateCache();
+        const nextToken = getAccessToken();
+        resolve(Boolean(previousToken && nextToken && nextToken !== previousToken));
+      });
     });
-    child.on('error', (err) => {
-      console.error('[auth] refresh command failed:', err.message);
-      resolve(false);
-    });
-    child.on('exit', (code) => {
-      if (verbose) console.log(`[auth] refresh command exited with ${code}`);
-      invalidateCache();
-      const nextToken = getAccessToken();
-      resolve(Boolean(previousToken && nextToken && nextToken !== previousToken));
-    });
-  }).finally(() => { _authRefreshPromise = null; });
+    return probeOk;
+  })().finally(() => { _authRefreshPromise = null; });
   return _authRefreshPromise;
 }
 
@@ -632,7 +774,17 @@ function createHandler(verbose, tokenLimit, notifyCommand, notifyWebhook) {
         forward(req.method, forwardUrl, h, body, res, verbose, retry ? null : () => attempt(true));
       }
 
-      attempt(false);
+      // Proactive token refresh: if the token is expired or about to expire,
+      // refresh it before forwarding rather than waiting for a 401.
+      if (_forward_autoRefreshAuth && isTokenExpiredOrExpiring()) {
+        if (verbose) console.log('[auth] token expired or expiring soon, refreshing proactively');
+        refreshHostAuth(verbose).then((ok) => {
+          if (ok) invalidateCache();
+          attempt(false);
+        });
+      } else {
+        attempt(false);
+      }
     });
   };
 }

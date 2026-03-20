@@ -71,7 +71,7 @@ BIND_BINARIES=false
 LAUNCH_SHELL=false
 ENABLE_GITHUB=false
 ENABLE_GITHUB_MCP=false
-AUTO_REFRESH_AUTH=false
+AUTO_REFRESH_AUTH=true
 PORT_MCP=58082             # in-sandbox TCP port for MCP bridge
 PORT_SLACK=58083           # in-sandbox TCP port for Slack webhook proxy
 HOST_PORT_MCP_SERVER=""
@@ -168,6 +168,7 @@ while [[ $# -gt 0 ]]; do
       echo "   Use --enable-github-mcp instead (recommended, token stays on host)."
       exit 1 ;;
     --auto-refresh-auth) AUTO_REFRESH_AUTH=true; shift ;;
+    --no-auto-refresh-auth) AUTO_REFRESH_AUTH=false; shift ;;
     --disable-github)    shift ;;  # no-op (--enable-github removed)
     --gh-token-file)     GH_TOKEN_FILE=$2; shift 2 ;;
     --enable-github-mcp) ENABLE_GITHUB_MCP=true; shift ;;
@@ -283,8 +284,9 @@ OPTIONS:
                          and github-mcp-server binary on host).
   --enable-github        REMOVED — leaked real token into sandbox.
                          Use --enable-github-mcp instead.
-  --auto-refresh-auth   On 401 responses, run a short host `claude -p ...` probe to let
-                        Claude refresh OAuth tokens, then retry once if the token changed.
+  --auto-refresh-auth   Auto-refresh expired OAuth tokens (default: enabled).
+                        Uses direct OAuth refresh, falls back to host Claude probe.
+  --no-auto-refresh-auth  Disable automatic OAuth token refresh.
   --gh-token-file FILE   Read GitHub PAT from FILE (default: ~/.config/claudebox/gh-token).
                          The GH_TOKEN env var takes priority if set.
   --mcp-port PORT        TCP port for MCP server bridge (default: 58082; range 1024-65535).
@@ -856,7 +858,11 @@ PROXY_ARGS=(
   --github-connect-port "$HOST_PORT_GITHUB_CONNECT"
 )
 [[ "$ENABLE_GITHUB" == true ]] && PROXY_ARGS+=(--enable-github)
-[[ "$AUTO_REFRESH_AUTH" == true ]] && PROXY_ARGS+=(--auto-refresh-auth)
+if [[ "$AUTO_REFRESH_AUTH" == true ]]; then
+  PROXY_ARGS+=(--auto-refresh-auth)
+else
+  PROXY_ARGS+=(--no-auto-refresh-auth)
+fi
 for _url in "${ALLOWLIST_URLS[@]+"${ALLOWLIST_URLS[@]}"}"; do
   PROXY_ARGS+=(--connect-allowlist "$_url")
 done
