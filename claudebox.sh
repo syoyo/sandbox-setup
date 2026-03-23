@@ -109,10 +109,15 @@ SHARE_NVIDIA=false     # share NVIDIA GPU devices (/dev/nvidia*) into the sandbo
 NVIDIA_DEVICES=""      # comma-separated GPU indices to expose (empty = all)
 PROXY_ONLY=false       # proxy-only mode: no bwrap/cgroups, just credential proxy + env
 PROXY_SERVICES=()      # additional services to proxy (e.g. "openai")
+PROXY_COMMAND=""       # shell command to execute in proxy-only mode
 PORT_OPENAI=58083      # in-sandbox TCP port for OpenAI proxy
 HOST_PORT_OPENAI=""
 SOCKET_OPENAI="$_SOCK_DIR/claude-proxy-openai-$$.sock"
 SANDBOX_SOCKET_OPENAI="/tmp/claude-proxy-openai.sock"
+PORT_CHATGPT=58084
+HOST_PORT_CHATGPT=""
+SOCKET_CHATGPT="$_SOCK_DIR/claude-proxy-chatgpt-$$.sock"
+SANDBOX_SOCKET_CHATGPT="/tmp/claude-proxy-chatgpt.sock"
 
 # ---------------------------------------------------------------------------
 # Profile pre-scan: extract --profile from args, load profile options, and
@@ -238,12 +243,16 @@ while [[ $# -gt 0 ]]; do
       [[ -n "${2:-}" && "$2" =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo "❌ --nvidia-devices: expected comma-separated GPU indices (e.g. 0,1,3)"; exit 1; }
       SHARE_NVIDIA=true; NVIDIA_DEVICES=$2; shift 2 ;;
     --proxy-only)       PROXY_ONLY=true; shift ;;
+    --proxy-command)    PROXY_COMMAND=$2; shift 2 ;;
     --proxy-service)
       [[ "$2" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "❌ --proxy-service: invalid service name '$2'"; exit 1; }
       PROXY_SERVICES+=("$2"); shift 2 ;;
     --openai-port)
       [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1024 && $2 <= 65535 )) || { echo "❌ --openai-port: invalid port '$2' (1024-65535)"; exit 1; }
       PORT_OPENAI=$2; shift 2 ;;
+    --chatgpt-port)
+      [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1024 && $2 <= 65535 )) || { echo "❌ --chatgpt-port: invalid port '$2' (1024-65535)"; exit 1; }
+      PORT_CHATGPT=$2; shift 2 ;;
     --dry-run)  DRY_RUN=true; shift ;;
     --token-limit)
       [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1000 )) || { echo "❌ --token-limit: invalid value '$2' (minimum 1000)"; exit 1; }
@@ -336,10 +345,13 @@ OPTIONS:
                          proxy and launches the command directly with env vars pointing to
                          the proxy. Provides credential protection without full isolation.
                          Project data is accessed directly (sync mode).
+  --proxy-command CMD    In proxy-only mode, run CMD via 'bash -lc' instead of launching
+                         Claude or an interactive shell.
   --proxy-service NAME   Enable credential proxy for an additional LLM service. Repeatable.
-                         Available presets: anthropic (default), openai.
+                         Available presets: anthropic (default), openai, chatgpt.
                          e.g. --proxy-service openai
   --openai-port PORT     TCP port for OpenAI proxy bridge (default: 58083; range 1024-65535).
+  --chatgpt-port PORT    TCP port for ChatGPT backend proxy bridge (default: 58084; range 1024-65535).
   --dry-run              Print the bwrap command without executing it.
   --mem-limit SIZE       Memory limit (e.g. 4G, 512M). Uses cgroups via systemd-run.
   --cpu-limit PERCENT    CPU limit as percentage (100 = 1 core, 200 = 2 cores).
@@ -614,6 +626,7 @@ if [[ "$PROXY_ONLY" == true ]]; then
   HOST_PORT_GITHUB_CONNECT="$PORT_GITHUB_CONNECT"
   HOST_PORT_MCP_SERVER="$PORT_MCP"
   HOST_PORT_OPENAI="$PORT_OPENAI"
+  HOST_PORT_CHATGPT="$PORT_CHATGPT"
 elif [[ "$ISOLATE_NET" == true ]]; then
   HOST_PORT_ANTHROPIC=$(allocate_free_port) || { echo "❌ failed to allocate host Anthropic bridge port"; exit 1; }
   HOST_PORT_GITHUB_CONNECT=$(allocate_free_port) || { echo "❌ failed to allocate host GitHub bridge port"; exit 1; }
@@ -630,11 +643,17 @@ elif [[ "$ISOLATE_NET" == true ]]; then
   while echo "$_used_ports" | grep -qw "$HOST_PORT_OPENAI"; do
     HOST_PORT_OPENAI=$(allocate_free_port) || { echo "❌ failed to allocate host OpenAI bridge port"; exit 1; }
   done
+  _used_ports="$HOST_PORT_ANTHROPIC $HOST_PORT_GITHUB_CONNECT $HOST_PORT_MCP_SERVER $HOST_PORT_OPENAI"
+  HOST_PORT_CHATGPT=$(allocate_free_port) || { echo "❌ failed to allocate host ChatGPT bridge port"; exit 1; }
+  while echo "$_used_ports" | grep -qw "$HOST_PORT_CHATGPT"; do
+    HOST_PORT_CHATGPT=$(allocate_free_port) || { echo "❌ failed to allocate host ChatGPT bridge port"; exit 1; }
+  done
 else
   HOST_PORT_ANTHROPIC="$PORT_ANTHROPIC"
   HOST_PORT_GITHUB_CONNECT="$PORT_GITHUB_CONNECT"
   HOST_PORT_MCP_SERVER="$PORT_MCP"
   HOST_PORT_OPENAI="$PORT_OPENAI"
+  HOST_PORT_CHATGPT="$PORT_CHATGPT"
 fi
 
 # ---------------------------------------------------------------------------
@@ -723,7 +742,7 @@ cleanup() {
   local code=$?
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
   [[ -n "$MCP_SERVER_PID" ]] && kill "$MCP_SERVER_PID" 2>/dev/null || true
-  rm -f "$SOCKET_ANTHROPIC" "$SOCKET_GITHUB" "$SOCKET_MCP" "$SOCKET_OPENAI" "$SOCKET_SLACK" 2>/dev/null || true
+  rm -f "$SOCKET_ANTHROPIC" "$SOCKET_GITHUB" "$SOCKET_MCP" "$SOCKET_OPENAI" "$SOCKET_CHATGPT" "$SOCKET_SLACK" 2>/dev/null || true
   if [[ -n "${SECCOMP_BPF:-}" ]]; then
     [[ -f "$SECCOMP_BPF" ]] && rm -f "$SECCOMP_BPF" 2>/dev/null || true
     exec 9<&- 2>/dev/null || true
@@ -935,6 +954,7 @@ fi
 
 # Additional LLM service proxies (--proxy-service openai, etc.)
 _HAS_OPENAI=false
+_HAS_CHATGPT=false
 for _svc in "${PROXY_SERVICES[@]+"${PROXY_SERVICES[@]}"}"; do
   PROXY_ARGS+=(--service "$_svc")
   case "$_svc" in
@@ -947,6 +967,11 @@ for _svc in "${PROXY_SERVICES[@]+"${PROXY_SERVICES[@]}"}"; do
       PROXY_ARGS+=(--service-socket "openai:$SOCKET_OPENAI")
       PROXY_ARGS+=(--service-port "openai:$HOST_PORT_OPENAI")
       ;;
+    chatgpt)
+      _HAS_CHATGPT=true
+      PROXY_ARGS+=(--service-socket "chatgpt:$SOCKET_CHATGPT")
+      PROXY_ARGS+=(--service-port "chatgpt:$HOST_PORT_CHATGPT")
+      ;;
   esac
 done
 
@@ -958,6 +983,7 @@ _wait_sockets() {
   [[ -S "$SOCKET_GITHUB" ]] || return 1
   [[ "$ENABLE_GITHUB_MCP" == true ]] && { [[ -S "$SOCKET_MCP" ]] || return 1; }
   [[ "$_HAS_OPENAI" == true ]] && { [[ -S "$SOCKET_OPENAI" ]] || return 1; }
+  [[ "$_HAS_CHATGPT" == true ]] && { [[ -S "$SOCKET_CHATGPT" ]] || return 1; }
   [[ -n "$SLACK_WEBHOOK" ]] && { [[ -S "$SOCKET_SLACK" ]] || return 1; }
   return 0
 }
@@ -970,6 +996,7 @@ done
 [[ -S "$SOCKET_GITHUB" ]]    || { echo "❌ GitHub proxy socket did not appear"; exit 1; }
 [[ "$ENABLE_GITHUB_MCP" == true ]] && { [[ -S "$SOCKET_MCP" ]] || { echo "❌ MCP bridge socket did not appear"; exit 1; }; }
 [[ "$_HAS_OPENAI" == true ]] && { [[ -S "$SOCKET_OPENAI" ]] || { echo "❌ OpenAI proxy socket did not appear"; exit 1; }; }
+[[ "$_HAS_CHATGPT" == true ]] && { [[ -S "$SOCKET_CHATGPT" ]] || { echo "❌ ChatGPT proxy socket did not appear"; exit 1; }; }
 [[ -n "$SLACK_WEBHOOK" ]] && { [[ -S "$SOCKET_SLACK" ]] || { echo "❌ Slack proxy socket did not appear"; exit 1; }; }
 _gh_desc="none"; [[ "$ENABLE_GITHUB" == true ]] && _gh_desc="api.github.com"
 [[ "$ENABLE_GITHUB_MCP" == true ]] && _gh_desc="${_gh_desc}+mcp"
@@ -979,6 +1006,7 @@ if [[ ${#ALLOWLIST_URLS[@]} -gt 0 ]]; then
 fi
 _svc_desc=""
 [[ "$_HAS_OPENAI" == true ]] && _svc_desc=", openai=$SOCKET_OPENAI"
+[[ "$_HAS_CHATGPT" == true ]] && _svc_desc+=", chatgpt=$SOCKET_CHATGPT"
 _slack_desc=""; [[ -n "$SLACK_WEBHOOK" ]] && _slack_desc=", slack=proxy"
 echo "✔ Proxy ready (anthropic=$SOCKET_ANTHROPIC, github=$SOCKET_GITHUB, allowlist=$_gh_desc${_svc_desc}${_slack_desc})"
 
@@ -1201,6 +1229,7 @@ if [[ "$PROXY_ONLY" == true ]]; then
   _PROXY_ENV=(
     ANTHROPIC_BASE_URL="http://127.0.0.1:$HOST_PORT_ANTHROPIC"
     CLAUDE_CONFIG_DIR="$_PROXY_ONLY_CLAUDE_DIR"
+    SESSION_DUMMY_TOKEN="$SESSION_DUMMY_TOKEN"
     NO_PROXY="127.0.0.1,localhost,::1"
     HTTP_PROXY=""
     ALL_PROXY=""
@@ -1218,6 +1247,9 @@ if [[ "$PROXY_ONLY" == true ]]; then
       OPENAI_API_KEY="$SESSION_DUMMY_TOKEN"
     )
     echo "  OpenAI proxy: http://127.0.0.1:$HOST_PORT_OPENAI"
+  fi
+  if [[ "$_HAS_CHATGPT" == true ]]; then
+    echo "  ChatGPT proxy: http://127.0.0.1:$HOST_PORT_CHATGPT/backend-api"
   fi
 
   # GitHub MCP: write settings.local.json with MCP config
@@ -1255,7 +1287,13 @@ MCPEOF
 
   # Launch the command
   PROXY_ONLY_EXIT=0
-  if [[ "$LAUNCH_SHELL" == true ]]; then
+  if [[ -n "$PROXY_COMMAND" && "$LAUNCH_SHELL" == true ]]; then
+    echo "❌ --proxy-command cannot be combined with --shell"
+    exit 1
+  elif [[ -n "$PROXY_COMMAND" ]]; then
+    echo "  Ctrl-C terminates the process"
+    (cd "$_PROXY_WORKDIR" && env "${_PROXY_ENV[@]}" bash -lc "$PROXY_COMMAND") || PROXY_ONLY_EXIT=$?
+  elif [[ "$LAUNCH_SHELL" == true ]]; then
     echo "  Exit the shell with Ctrl-D or 'exit'"
     (cd "$_PROXY_WORKDIR" && env "${_PROXY_ENV[@]}" bash) || PROXY_ONLY_EXIT=$?
   else

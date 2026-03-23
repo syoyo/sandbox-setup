@@ -195,7 +195,14 @@ Unix socket and TCP bridge, with service-specific credential retrieval and path 
 | Service | Upstream | Auth | Credential Source | Port |
 |---------|----------|------|-------------------|------|
 | `anthropic` | api.anthropic.com | OAuth / x-api-key | CLAUDE_CREDENTIALS_FILE, keychain, ~/.claude/.credentials.json | 58080 |
-| `openai` | api.openai.com | Bearer token | OPENAI_API_KEY, OPENAI_CREDENTIALS_FILE, ~/.config/claudebox/openai-key | 58083 |
+| `openai` | api.openai.com | Bearer token | OPENAI_API_KEY, OPENAI_CREDENTIALS_FILE, ~/.config/claudebox/openai-key, ~/.codex/auth.json | 58083 |
+
+Preferred approach: use a project-scoped `OPENAI_API_KEY` (or `~/.config/claudebox/openai-key`) for OpenAI/Codex runs.
+This is the most stable setup for the Responses API and avoids ChatGPT account scope mismatches.
+
+Temporary compatibility: if no API key is configured, the OpenAI proxy will also read host Codex auth from
+`~/.codex/auth.json` and can refresh it. This is useful for short-term local use, but it may still fail if the
+current ChatGPT/Codex credential does not have `api.responses.write`.
 
 ```bash
 # Enable OpenAI proxy alongside default Anthropic
@@ -221,6 +228,9 @@ This is useful for:
 ```bash
 # Proxy-only with shell — run any LLM tool with proxied credentials
 OPENAI_API_KEY=sk-xxx ./claudebox.sh --proxy-only --proxy-service openai --shell
+
+# Temporary fallback: if OPENAI_API_KEY is unset, claudebox can reuse host
+# Codex ChatGPT auth from ~/.codex/auth.json when available.
 
 # Inside the shell:
 #   ANTHROPIC_BASE_URL=http://127.0.0.1:58080

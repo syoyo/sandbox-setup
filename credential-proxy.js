@@ -108,7 +108,10 @@ const SERVICE_PRESETS = {
     name: 'openai',
     upstream: 'api.openai.com',
     upstreamPort: 443,
-    pathAllowlist: /^\/v1\/(chat\/completions|completions|models|embeddings|audio|images|moderations|files|fine_tuning|batches|responses)(\/|$)/,
+    // Codex/OpenAI clients are inconsistent here: some send /v1/... while
+    // others set a base URL that already includes /v1 and then request
+    // /responses directly. Accept both forms for the known OpenAI endpoints.
+    pathAllowlist: /^\/(?:v1\/)?(chat\/completions|completions|models|embeddings|audio|images|moderations|files|fine_tuning|batches|responses)(\/|$)/,
     authHeaders: ['authorization'],
     defaultPort: 58083,
     envBaseUrl: 'OPENAI_BASE_URL',
@@ -127,6 +130,22 @@ const SERVICE_PRESETS = {
       return null;
     },
   },
+  chatgpt: {
+    name: 'chatgpt',
+    upstream: 'chatgpt.com',
+    upstreamPort: 443,
+    pathAllowlist: /^\/backend-api(\/|$)/,
+    authHeaders: ['authorization', 'chatgpt-account-id'],
+    defaultPort: 58084,
+    envBaseUrl: 'CHATGPT_BASE_URL',
+    getCredential: () => {
+      const creds = getOpenAICredentials();
+      return creds?.kind === 'chatgpt' ? creds : null;
+    },
+    extractUsage() {
+      return null;
+    },
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -134,41 +153,208 @@ const SERVICE_PRESETS = {
 // ---------------------------------------------------------------------------
 let _openaiCredsCache = null;
 let _openaiCredsCacheTime = 0;
+const OPENAI_OAUTH_TOKEN_URL = process.env.CODEX_REFRESH_TOKEN_URL_OVERRIDE || 'https://auth.openai.com/oauth/token';
+const OPENAI_OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 
-function getOpenAIKey() {
+function decodeJwtExpMs(token) {
+  if (typeof token !== 'string' || !token.includes('.')) return null;
+  try {
+    const payload = token.split('.')[1];
+    const normalized = payload.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+    const json = JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
+    return typeof json?.exp === 'number' ? json.exp * 1000 : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function getOpenAIAuthFilePath() {
+  return path.join(os.homedir(), '.codex', 'auth.json');
+}
+
+function getOpenAICredentials() {
   const now = Date.now();
   if (_openaiCredsCache && now - _openaiCredsCacheTime < CACHE_TTL_MS) return _openaiCredsCache;
 
-  let key = null;
+  let creds = null;
 
   // 1. Dedicated credential file (like CLAUDE_CREDENTIALS_FILE for Anthropic)
   const envFile = process.env.OPENAI_CREDENTIALS_FILE;
   if (envFile) {
-    try { key = fs.readFileSync(envFile, 'utf8').trim(); } catch (_) {}
+    try {
+      const token = fs.readFileSync(envFile, 'utf8').trim();
+      if (token) creds = { kind: 'api_key', token, source: envFile };
+    } catch (_) {}
   }
 
   // 2. _REAL_OPENAI_API_KEY — set by claudebox.sh before replacing OPENAI_API_KEY with dummy.
   // This prevents the proxy from reading the dummy token from its own env.
-  if (!key && process.env._REAL_OPENAI_API_KEY) key = process.env._REAL_OPENAI_API_KEY;
+  if (!creds && process.env._REAL_OPENAI_API_KEY) {
+    creds = { kind: 'api_key', token: process.env._REAL_OPENAI_API_KEY, source: '_REAL_OPENAI_API_KEY' };
+  }
 
   // 3. OPENAI_API_KEY env var (fallback; works when proxy env is not modified)
-  if (!key && process.env.OPENAI_API_KEY) key = process.env.OPENAI_API_KEY;
+  if (!creds && process.env.OPENAI_API_KEY) {
+    creds = { kind: 'api_key', token: process.env.OPENAI_API_KEY, source: 'OPENAI_API_KEY' };
+  }
 
   // 4. File-based fallbacks
-  if (!key) {
+  if (!creds) {
     for (const p of [
       path.join(os.homedir(), '.config', 'claudebox', 'openai-key'),
       path.join(os.homedir(), '.config', 'openai', 'api_key'),
     ]) {
       try {
-        const content = fs.readFileSync(p, 'utf8').trim();
-        if (content) { key = content; break; }
+        const token = fs.readFileSync(p, 'utf8').trim();
+        if (token) {
+          creds = { kind: 'api_key', token, source: p };
+          break;
+        }
       } catch (_) {}
     }
   }
 
-  if (key) { _openaiCredsCache = key; _openaiCredsCacheTime = now; }
-  return key;
+  // 5. Codex CLI auth fallback. When the user is logged into Codex with
+  // ChatGPT auth, there may be no standalone OPENAI_API_KEY on the host, but
+  // ~/.codex/auth.json contains a bearer token that works against api.openai.com.
+  if (!creds) {
+    try {
+      const codexAuthPath = getOpenAIAuthFilePath();
+      const auth = JSON.parse(fs.readFileSync(codexAuthPath, 'utf8'));
+      if (typeof auth?.OPENAI_API_KEY === 'string' && auth.OPENAI_API_KEY.trim()) {
+        creds = { kind: 'api_key', token: auth.OPENAI_API_KEY.trim(), source: codexAuthPath };
+      } else if (typeof auth?.tokens?.access_token === 'string' && auth.tokens.access_token.trim()) {
+        const accessToken = auth.tokens.access_token.trim();
+        creds = {
+          kind: 'chatgpt',
+          token: accessToken,
+          refreshToken: typeof auth?.tokens?.refresh_token === 'string' ? auth.tokens.refresh_token.trim() : null,
+          accountId: typeof auth?.tokens?.account_id === 'string' ? auth.tokens.account_id.trim() : null,
+          expiresAt: decodeJwtExpMs(accessToken),
+          authFile: codexAuthPath,
+          source: codexAuthPath,
+        };
+      }
+    } catch (_) {}
+  }
+
+  if (creds) { _openaiCredsCache = creds; _openaiCredsCacheTime = now; }
+  return creds;
+}
+
+function getOpenAIKey() {
+  return getOpenAICredentials()?.token ?? null;
+}
+
+function invalidateOpenAICache() {
+  _openaiCredsCache = null;
+}
+
+function isOpenAITokenExpiredOrExpiring() {
+  const creds = getOpenAICredentials();
+  if (creds?.kind !== 'chatgpt' || !creds.expiresAt) return false;
+  return Date.now() >= creds.expiresAt - 120_000;
+}
+
+function isOpenAIRefreshable() {
+  const creds = getOpenAICredentials();
+  return creds?.kind === 'chatgpt' && typeof creds.refreshToken === 'string' && creds.refreshToken.length > 0;
+}
+
+function updateOpenAIAuthFile(tokenResponse) {
+  const authPath = getOpenAIAuthFilePath();
+  try {
+    if (!fs.existsSync(authPath)) return false;
+    const auth = JSON.parse(fs.readFileSync(authPath, 'utf8'));
+    auth.auth_mode = auth.auth_mode || 'chatgpt';
+    auth.tokens = auth.tokens || {};
+    if (typeof tokenResponse.access_token === 'string' && tokenResponse.access_token) {
+      auth.tokens.access_token = tokenResponse.access_token;
+    }
+    if (typeof tokenResponse.refresh_token === 'string' && tokenResponse.refresh_token) {
+      auth.tokens.refresh_token = tokenResponse.refresh_token;
+    }
+    if (typeof tokenResponse.id_token === 'string' && tokenResponse.id_token) {
+      auth.tokens.id_token = tokenResponse.id_token;
+    }
+    auth.last_refresh = new Date().toISOString();
+    fs.writeFileSync(authPath, JSON.stringify(auth, null, 2), 'utf8');
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function refreshOpenAITokenDirectly(verbose) {
+  return new Promise((resolve) => {
+    const creds = getOpenAICredentials();
+    if (creds?.kind !== 'chatgpt' || !creds.refreshToken) {
+      if (verbose) console.log('[openai-auth] no refreshable Codex auth found for direct refresh');
+      resolve(false);
+      return;
+    }
+
+    const payload = new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: creds.refreshToken,
+      client_id: OPENAI_OAUTH_CLIENT_ID,
+    }).toString();
+
+    const u = new URL(OPENAI_OAUTH_TOKEN_URL);
+    const opts = {
+      hostname: u.hostname,
+      port: u.port || 443,
+      path: u.pathname + u.search,
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        'accept': 'application/json',
+        'content-length': Buffer.byteLength(payload),
+      },
+    };
+
+    if (verbose) console.log('[openai-auth] attempting direct OAuth token refresh');
+    const req = https.request(opts, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const body = Buffer.concat(chunks).toString('utf8');
+        if (res.statusCode !== 200) {
+          console.warn(`[openai-auth] direct refresh failed: HTTP ${res.statusCode}: ${body.slice(0, 200)}`);
+          resolve(false);
+          return;
+        }
+        try {
+          const data = JSON.parse(body);
+          if (!data?.access_token) {
+            console.warn('[openai-auth] direct refresh: no access_token in response');
+            resolve(false);
+            return;
+          }
+          if (updateOpenAIAuthFile(data)) {
+            invalidateOpenAICache();
+            if (verbose) console.log('[openai-auth] direct refresh succeeded, credentials updated');
+            resolve(true);
+          } else {
+            console.warn('[openai-auth] direct refresh: failed to write updated credentials');
+            resolve(false);
+          }
+        } catch (e) {
+          console.warn('[openai-auth] direct refresh: failed to parse response:', e.message);
+          resolve(false);
+        }
+      });
+    });
+
+    req.on('error', (err) => {
+      console.warn('[openai-auth] direct refresh request error:', err.message);
+      resolve(false);
+    });
+
+    req.write(payload);
+    req.end();
+  });
 }
 
 // Private/reserved IP check — covers RFC 1918, loopback, link-local,
@@ -534,6 +720,7 @@ let _forward_notifyCommand = null;
 let _forward_notifyWebhook = null;
 let _forward_autoRefreshAuth = false;
 let _authRefreshPromise = null;
+let _openaiAuthRefreshPromise = null;
 
 function getTokenSummary() {
   return { input: _totalInputTokens, output: _totalOutputTokens, total: getTotalTokens(), requests: _totalRequests };
@@ -602,6 +789,55 @@ async function refreshHostAuth(verbose) {
     return probeOk;
   })().finally(() => { _authRefreshPromise = null; });
   return _authRefreshPromise;
+}
+
+function isRefreshableOpenAIAuthFailure(statusCode, bodyText) {
+  if (statusCode !== 401 || !isOpenAIRefreshable()) return false;
+  const msg = String(
+    parseJsonSafe(bodyText)?.error?.message ??
+    parseJsonSafe(bodyText)?.message ??
+    bodyText ??
+    ''
+  ).toLowerCase();
+  if (!msg) return true;
+  if (msg.includes('missing scopes') || msg.includes('insufficient permissions')) return false;
+  return msg.includes('expired') ||
+    msg.includes('invalid') ||
+    msg.includes('unauthorized') ||
+    msg.includes('token') ||
+    msg.includes('authentication');
+}
+
+async function refreshHostOpenAIAuth(verbose) {
+  if (_openaiAuthRefreshPromise) return _openaiAuthRefreshPromise;
+  _openaiAuthRefreshPromise = (async () => {
+    console.warn('[openai-auth] Attempting token refresh');
+
+    const directOk = await refreshOpenAITokenDirectly(verbose);
+    if (directOk) return true;
+
+    console.warn('[openai-auth] Direct refresh failed; falling back to host Codex probe');
+    const previousToken = getOpenAIKey();
+    const probeOk = await new Promise((resolve) => {
+      const child = spawn('codex', ['exec', '--skip-git-repo-check', '--color', 'never', 'hello'], {
+        stdio: 'ignore',
+        cwd: os.tmpdir(),
+        env: process.env,
+      });
+      child.on('error', (err) => {
+        console.error('[openai-auth] refresh command failed:', err.message);
+        resolve(false);
+      });
+      child.on('exit', (code) => {
+        if (verbose) console.log(`[openai-auth] refresh command exited with ${code}`);
+        invalidateOpenAICache();
+        const nextToken = getOpenAIKey();
+        resolve(Boolean(previousToken && nextToken && nextToken !== previousToken));
+      });
+    });
+    return probeOk;
+  })().finally(() => { _openaiAuthRefreshPromise = null; });
+  return _openaiAuthRefreshPromise;
 }
 
 // ---------------------------------------------------------------------------
@@ -1201,15 +1437,52 @@ function startConnectProxySocket(socketPath, allowlist, verbose) {
 function createGenericServiceHandler(preset, dummyToken, verbose) {
   const tag = `[${preset.name}]`;
 
+  function normalizeForwardPath(pathname) {
+    if (preset.name === 'openai' && !pathname.startsWith('/v1/')) {
+      return `/v1${pathname}`;
+    }
+    return pathname;
+  }
+
   function injectServiceAuth(headers) {
     const cred = preset.getCredential();
     if (!cred) return { ok: false, error: 'Credential error' };
 
+    if (preset.name === 'chatgpt') {
+      const updated = {};
+      let authOk = false;
+      let accountOk = false;
+      for (const [k, v] of Object.entries(headers)) {
+        const kl = k.toLowerCase();
+        if (kl === 'authorization' && typeof v === 'string') {
+          updated[k] = `Bearer ${cred.token}`;
+          authOk = true;
+        } else if (kl === 'chatgpt-account-id' && typeof v === 'string') {
+          if (!cred.accountId) return { ok: false, error: 'ChatGPT account ID not available' };
+          updated[k] = cred.accountId;
+          accountOk = true;
+        } else if (kl === 'authorization' || kl === 'chatgpt-account-id') {
+          return { ok: false, error: 'Auth header rejected' };
+        } else {
+          updated[k] = v;
+        }
+      }
+
+      if (!authOk) updated.authorization = `Bearer ${cred.token}`;
+      if (!accountOk) {
+        if (!cred.accountId) return { ok: false, error: 'ChatGPT account ID not available' };
+        updated['chatgpt-account-id'] = cred.accountId;
+      }
+      return { ok: true, headers: updated };
+    }
+
     const updated = {};
     let replaced = false;
+    let sawAuthHeader = false;
     for (const [k, v] of Object.entries(headers)) {
       const kl = k.toLowerCase();
       if (preset.authHeaders.includes(kl) && typeof v === 'string') {
+        sawAuthHeader = true;
         const bare = /^Bearer /i.test(v) ? v.slice(7) : v;
         if (bare !== dummyToken) {
           return { ok: false, error: 'Auth header rejected' };
@@ -1217,6 +1490,7 @@ function createGenericServiceHandler(preset, dummyToken, verbose) {
         updated[k] = v.replace(dummyToken, cred);
         replaced = true;
       } else if (preset.authHeaders.includes(kl)) {
+        sawAuthHeader = true;
         return { ok: false, error: 'Auth header rejected' };
       } else {
         updated[k] = v;
@@ -1224,12 +1498,23 @@ function createGenericServiceHandler(preset, dummyToken, verbose) {
     }
 
     if (!replaced) {
-      return { ok: false, error: 'Auth header rejected' };
+      if (sawAuthHeader) {
+        return { ok: false, error: 'Auth header rejected' };
+      }
+      const preferredHeader = preset.authHeaders.includes('authorization')
+        ? 'authorization'
+        : preset.authHeaders[0];
+      if (!preferredHeader) {
+        return { ok: false, error: 'Auth header rejected' };
+      }
+      updated[preferredHeader] = preferredHeader === 'authorization'
+        ? `Bearer ${cred}`
+        : cred;
     }
     return { ok: true, headers: updated };
   }
 
-  function forwardServiceRequest(method, urlPath, headers, body, res) {
+  function forwardServiceRequest(method, urlPath, headers, body, res, onRetry) {
     const opts = { hostname: preset.upstream, port: preset.upstreamPort, path: urlPath, method, headers };
     if (verbose) console.log(`${tag} → ${method} https://${preset.upstream}${urlPath}`);
 
@@ -1280,6 +1565,26 @@ function createGenericServiceHandler(preset, dummyToken, verbose) {
           const durationMs = Date.now() - reqStartTime;
           const respText = respBody.toString('utf8');
 
+          if (upstream.statusCode === 401 && onRetry) {
+            if (_forward_autoRefreshAuth &&
+                (preset.name === 'openai' || preset.name === 'chatgpt') &&
+                isRefreshableOpenAIAuthFailure(upstream.statusCode, respText)) {
+              refreshHostOpenAIAuth(verbose).then((ok) => {
+                if (!ok) {
+                  if (!res.headersSent) res.writeHead(upstream.statusCode, respHeaders);
+                  res.end(respBody);
+                  return;
+                }
+                invalidateOpenAICache();
+                setImmediate(onRetry);
+              });
+              return;
+            }
+            if (!res.headersSent) res.writeHead(upstream.statusCode, respHeaders);
+            res.end(respBody);
+            return;
+          }
+
           const usage = preset.extractUsage(upstream.statusCode, false, respText, null);
           if (usage) trackUsage(usage, verbose);
 
@@ -1325,7 +1630,7 @@ function createGenericServiceHandler(preset, dummyToken, verbose) {
       return;
     }
 
-    const forwardUrl = normalizedPath + parsed.search;
+    const forwardUrl = normalizeForwardPath(normalizedPath) + parsed.search;
     touchActivity();
 
     const chunks = [];
@@ -1351,16 +1656,36 @@ function createGenericServiceHandler(preset, dummyToken, verbose) {
       const base = filterRequestHeaders(req.headers);
       base['host'] = preset.upstream;
 
-      const result = injectServiceAuth(base);
-      if (!result.ok) {
-        console.error(`${tag} credential error:`, result.error);
-        res.writeHead(401, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Authentication failed' }));
+      function attempt(retry) {
+        if (retry && (preset.name === 'openai' || preset.name === 'chatgpt')) invalidateOpenAICache();
+        const result = injectServiceAuth(retry ? filterRequestHeaders(req.headers) : base);
+        if (!result.ok) {
+          console.error(`${tag} credential error:`, result.error);
+          res.writeHead(401, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Authentication failed' }));
+          return;
+        }
+        const h = result.headers;
+        if (body.length) h['content-length'] = String(body.length);
+        forwardServiceRequest(req.method, forwardUrl, h, body, res, retry ? null : () => attempt(true));
+      }
+
+      if (_forward_autoRefreshAuth &&
+          (preset.name === 'openai' || preset.name === 'chatgpt') &&
+          isOpenAITokenExpiredOrExpiring()) {
+        if (verbose) console.log('[openai-auth] token expired or expiring soon, refreshing proactively');
+        refreshHostOpenAIAuth(verbose).then((ok) => {
+          if (!ok) {
+            attempt(false);
+            return;
+          }
+          invalidateOpenAICache();
+          attempt(false);
+        });
         return;
       }
-      const h = result.headers;
-      if (body.length) h['content-length'] = String(body.length);
-      forwardServiceRequest(req.method, forwardUrl, h, body, res);
+
+      attempt(false);
     });
   };
 }
