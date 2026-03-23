@@ -37,6 +37,17 @@ const url   = require('url');
 const { spawnSync, spawn } = require('child_process');
 
 // ---------------------------------------------------------------------------
+// SEC: Redact sensitive tokens from log output to prevent credential leakage.
+// ---------------------------------------------------------------------------
+function redactTokens(text) {
+  if (typeof text !== 'string') return String(text);
+  return text
+    .replace(/eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '[REDACTED_JWT]')
+    .replace(/sk-[a-zA-Z0-9_-]{20,}/g, '[REDACTED_KEY]')
+    .replace(/"(?:access_token|refresh_token|id_token)"\s*:\s*"[^"]+"/g, '"$1":"[REDACTED]"');
+}
+
+// ---------------------------------------------------------------------------
 // Dummy token placed in the sandbox by claudebox.sh.
 // The proxy replaces it with the real token before forwarding.
 // HIGH-4: per-session random token from SESSION_DUMMY_TOKEN env.
@@ -108,10 +119,9 @@ const SERVICE_PRESETS = {
     name: 'openai',
     upstream: 'api.openai.com',
     upstreamPort: 443,
-    // Codex/OpenAI clients are inconsistent here: some send /v1/... while
-    // others set a base URL that already includes /v1 and then request
-    // /responses directly. Accept both forms for the known OpenAI endpoints.
-    pathAllowlist: /^\/(?:v1\/)?(chat\/completions|completions|models|embeddings|audio|images|moderations|files|fine_tuning|batches|responses)(\/|$)/,
+    // SEC: require /v1/ prefix. Bare paths (e.g. /responses) are normalized to
+    // /v1/responses by normalizeForwardPath() before hitting this allowlist.
+    pathAllowlist: /^\/v1\/(chat\/completions|completions|models|embeddings|audio|images|moderations|files|fine_tuning|batches|responses)(\/|$)/,
     authHeaders: ['authorization'],
     defaultPort: 58083,
     envBaseUrl: 'OPENAI_BASE_URL',
@@ -221,6 +231,12 @@ function getOpenAICredentials() {
   if (!creds) {
     try {
       const codexAuthPath = getOpenAIAuthFilePath();
+      // SEC: reject auth file if group/other-readable (must be 0600 or 0400)
+      const authStat = fs.statSync(codexAuthPath);
+      if (authStat.mode & 0o077) {
+        console.warn(`[openai-auth] Refusing ${codexAuthPath}: permissions too open (${(authStat.mode & 0o777).toString(8)}). Run: chmod 600 ${codexAuthPath}`);
+        return creds;
+      }
       const auth = JSON.parse(fs.readFileSync(codexAuthPath, 'utf8'));
       if (typeof auth?.OPENAI_API_KEY === 'string' && auth.OPENAI_API_KEY.trim()) {
         creds = { kind: 'api_key', token: auth.OPENAI_API_KEY.trim(), source: codexAuthPath };
@@ -279,7 +295,10 @@ function updateOpenAIAuthFile(tokenResponse) {
       auth.tokens.id_token = tokenResponse.id_token;
     }
     auth.last_refresh = new Date().toISOString();
-    fs.writeFileSync(authPath, JSON.stringify(auth, null, 2), 'utf8');
+    // SEC: write with restrictive permissions (owner-only read/write)
+    const content = JSON.stringify(auth, null, 2);
+    const fd = fs.openSync(authPath, 'w', 0o600);
+    try { fs.writeSync(fd, content); } finally { fs.closeSync(fd); }
     return true;
   } catch (_) {
     return false;
@@ -321,14 +340,41 @@ function refreshOpenAITokenDirectly(verbose) {
       res.on('end', () => {
         const body = Buffer.concat(chunks).toString('utf8');
         if (res.statusCode !== 200) {
-          console.warn(`[openai-auth] direct refresh failed: HTTP ${res.statusCode}: ${body.slice(0, 200)}`);
+          console.warn(`[openai-auth] direct refresh failed: HTTP ${res.statusCode}: ${redactTokens(body.slice(0, 200))}`);
           resolve(false);
           return;
         }
         try {
           const data = JSON.parse(body);
-          if (!data?.access_token) {
-            console.warn('[openai-auth] direct refresh: no access_token in response');
+          // SEC: strict validation of refresh response
+          if (typeof data !== 'object' || data === null) {
+            console.warn('[openai-auth] direct refresh: response is not an object');
+            resolve(false);
+            return;
+          }
+          if (typeof data.access_token !== 'string' || data.access_token.length < 10) {
+            console.warn('[openai-auth] direct refresh: invalid or missing access_token');
+            resolve(false);
+            return;
+          }
+          if (!data.access_token.includes('.') && !data.access_token.startsWith('sk-')) {
+            console.warn('[openai-auth] direct refresh: access_token has unexpected format');
+            resolve(false);
+            return;
+          }
+          if (/[\x00-\x1f\x7f]/.test(data.access_token)) {
+            console.warn('[openai-auth] direct refresh: token contains control characters');
+            resolve(false);
+            return;
+          }
+          if (data.token_type && data.token_type.toLowerCase() !== 'bearer') {
+            console.warn('[openai-auth] direct refresh: unexpected token_type');
+            resolve(false);
+            return;
+          }
+          if (data.refresh_token !== undefined &&
+              (typeof data.refresh_token !== 'string' || /[\x00-\x1f\x7f]/.test(data.refresh_token))) {
+            console.warn('[openai-auth] direct refresh: invalid refresh_token');
             resolve(false);
             return;
           }
@@ -620,7 +666,7 @@ function refreshTokenDirectly(verbose) {
       res.on('end', () => {
         const body = Buffer.concat(chunks).toString('utf8');
         if (res.statusCode !== 200) {
-          console.warn(`[auth] direct refresh failed: HTTP ${res.statusCode}: ${body.slice(0, 200)}`);
+          console.warn(`[auth] direct refresh failed: HTTP ${res.statusCode}: ${redactTokens(body.slice(0, 200))}`);
           resolve(false);
           return;
         }
@@ -630,8 +676,20 @@ function refreshTokenDirectly(verbose) {
           const newRefreshToken = data.refresh_token;
           const expiresIn = data.expires_in; // seconds
 
-          if (!newAccessToken) {
-            console.warn('[auth] direct refresh: no access_token in response');
+          // SEC: strict validation of refresh response
+          if (typeof newAccessToken !== 'string' || newAccessToken.length < 10) {
+            console.warn('[auth] direct refresh: invalid or missing access_token');
+            resolve(false);
+            return;
+          }
+          if (/[\x00-\x1f\x7f]/.test(newAccessToken)) {
+            console.warn('[auth] direct refresh: token contains control characters');
+            resolve(false);
+            return;
+          }
+          if (newRefreshToken !== undefined &&
+              (typeof newRefreshToken !== 'string' || /[\x00-\x1f\x7f]/.test(newRefreshToken))) {
+            console.warn('[auth] direct refresh: invalid refresh_token');
             resolve(false);
             return;
           }
@@ -683,7 +741,10 @@ function updateCredentialsFile(newAccessToken, newRefreshToken, expiresIn) {
         if (expiresIn) {
           creds.claudeAiOauth.expiresAt = Date.now() + expiresIn * 1000;
         }
-        fs.writeFileSync(p, JSON.stringify(creds, null, 2), 'utf8');
+        // SEC: write with restrictive permissions (owner-only read/write)
+        const content = JSON.stringify(creds, null, 2);
+        const fd = fs.openSync(p, 'w', 0o600);
+        try { fs.writeSync(fd, content); } finally { fs.closeSync(fd); }
         return true;
       }
     } catch (_) {}
@@ -721,6 +782,10 @@ let _forward_notifyWebhook = null;
 let _forward_autoRefreshAuth = false;
 let _authRefreshPromise = null;
 let _openaiAuthRefreshPromise = null;
+// SEC: cooldown to prevent hammering OAuth endpoints on repeated failures
+let _lastAuthRefreshTime = 0;
+let _lastOpenAIAuthRefreshTime = 0;
+const AUTH_REFRESH_COOLDOWN_MS = 30_000;
 
 function getTokenSummary() {
   return { input: _totalInputTokens, output: _totalOutputTokens, total: getTotalTokens(), requests: _totalRequests };
@@ -759,6 +824,12 @@ function isExpiredOauthResponse(statusCode, bodyText) {
 }
 
 async function refreshHostAuth(verbose) {
+  const now = Date.now();
+  if (now - _lastAuthRefreshTime < AUTH_REFRESH_COOLDOWN_MS) {
+    if (verbose) console.log('[auth] refresh cooldown active, skipping');
+    return false;
+  }
+  _lastAuthRefreshTime = now;
   if (_authRefreshPromise) return _authRefreshPromise;
   _authRefreshPromise = (async () => {
     console.warn('[auth] Attempting token refresh');
@@ -809,6 +880,12 @@ function isRefreshableOpenAIAuthFailure(statusCode, bodyText) {
 }
 
 async function refreshHostOpenAIAuth(verbose) {
+  const now = Date.now();
+  if (now - _lastOpenAIAuthRefreshTime < AUTH_REFRESH_COOLDOWN_MS) {
+    if (verbose) console.log('[openai-auth] refresh cooldown active, skipping');
+    return false;
+  }
+  _lastOpenAIAuthRefreshTime = now;
   if (_openaiAuthRefreshPromise) return _openaiAuthRefreshPromise;
   _openaiAuthRefreshPromise = (async () => {
     console.warn('[openai-auth] Attempting token refresh');
@@ -1437,9 +1514,22 @@ function startConnectProxySocket(socketPath, allowlist, verbose) {
 function createGenericServiceHandler(preset, dummyToken, verbose) {
   const tag = `[${preset.name}]`;
 
+  // SEC: only map known bare paths to /v1/ — reject unknown bare paths rather
+  // than blindly prepending /v1 to arbitrary input.
+  const OPENAI_KNOWN_BARE_PATHS = new Set([
+    '/chat/completions', '/completions', '/models', '/embeddings',
+    '/audio', '/images', '/moderations', '/files',
+    '/fine_tuning', '/batches', '/responses',
+  ]);
+
   function normalizeForwardPath(pathname) {
     if (preset.name === 'openai' && !pathname.startsWith('/v1/')) {
-      return `/v1${pathname}`;
+      // Extract the top-level path segment for matching (e.g. /responses/123 → /responses)
+      const seg = '/' + pathname.split('/').filter(Boolean)[0];
+      if (OPENAI_KNOWN_BARE_PATHS.has(seg) || OPENAI_KNOWN_BARE_PATHS.has(pathname)) {
+        return `/v1${pathname}`;
+      }
+      // Unknown bare path — leave unchanged (will be caught by allowlist)
     }
     return pathname;
   }
@@ -1455,6 +1545,11 @@ function createGenericServiceHandler(preset, dummyToken, verbose) {
       for (const [k, v] of Object.entries(headers)) {
         const kl = k.toLowerCase();
         if (kl === 'authorization' && typeof v === 'string') {
+          // SEC: require dummy token in Authorization header to prove request came from sandbox
+          const bare = /^Bearer /i.test(v) ? v.slice(7) : v;
+          if (bare !== dummyToken) {
+            return { ok: false, error: 'Auth header rejected: invalid dummy token' };
+          }
           updated[k] = `Bearer ${cred.token}`;
           authOk = true;
         } else if (kl === 'chatgpt-account-id' && typeof v === 'string') {
@@ -1468,7 +1563,10 @@ function createGenericServiceHandler(preset, dummyToken, verbose) {
         }
       }
 
-      if (!authOk) updated.authorization = `Bearer ${cred.token}`;
+      // SEC: reject requests without Authorization header — require dummy token proof
+      if (!authOk) {
+        return { ok: false, error: 'Auth header rejected: missing authorization' };
+      }
       if (!accountOk) {
         if (!cred.accountId) return { ok: false, error: 'ChatGPT account ID not available' };
         updated['chatgpt-account-id'] = cred.accountId;
@@ -1497,19 +1595,11 @@ function createGenericServiceHandler(preset, dummyToken, verbose) {
       }
     }
 
+    // SEC: always require the dummy token to be present in an auth header.
+    // Reject requests with no auth header or auth header without dummy token.
+    // This prevents any process that reaches the proxy from getting free credentials.
     if (!replaced) {
-      if (sawAuthHeader) {
-        return { ok: false, error: 'Auth header rejected' };
-      }
-      const preferredHeader = preset.authHeaders.includes('authorization')
-        ? 'authorization'
-        : preset.authHeaders[0];
-      if (!preferredHeader) {
-        return { ok: false, error: 'Auth header rejected' };
-      }
-      updated[preferredHeader] = preferredHeader === 'authorization'
-        ? `Bearer ${cred}`
-        : cred;
+      return { ok: false, error: 'Auth header rejected' };
     }
     return { ok: true, headers: updated };
   }
@@ -1614,8 +1704,12 @@ function createGenericServiceHandler(preset, dummyToken, verbose) {
     const parsed = new URL(req.url, 'http://localhost');
     const normalizedPath = path.posix.normalize(parsed.pathname);
 
-    if (!preset.pathAllowlist.test(normalizedPath)) {
-      if (verbose) console.log(`${tag} blocked path: ${normalizedPath}`);
+    // SEC: normalize path FIRST, then validate the allowlist against the actual
+    // forwarded path. This ensures the allowlist approves exactly what gets sent upstream.
+    const forwardPath = normalizeForwardPath(normalizedPath);
+
+    if (!preset.pathAllowlist.test(forwardPath)) {
+      if (verbose) console.log(`${tag} blocked path: ${normalizedPath} (forward: ${forwardPath})`);
       res.writeHead(403, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'Path not allowed' }));
       return;
@@ -1630,7 +1724,7 @@ function createGenericServiceHandler(preset, dummyToken, verbose) {
       return;
     }
 
-    const forwardUrl = normalizeForwardPath(normalizedPath) + parsed.search;
+    const forwardUrl = forwardPath + parsed.search;
     touchActivity();
 
     const chunks = [];
@@ -1840,7 +1934,7 @@ function startSlackWebhookProxy(socketPath, webhookUrl, verbose) {
             // upstream response headers (Set-Cookie, Location, etc.) to sandbox.
             res.writeHead(proxyRes.statusCode, { 'Content-Type': 'text/plain' });
             res.end(respBody);
-            if (verbose) console.log(`${tag} Slack responded: ${proxyRes.statusCode} ${respBody.slice(0, 100)}`);
+            if (verbose) console.log(`${tag} Slack responded: ${proxyRes.statusCode} ${redactTokens(respBody.slice(0, 100))}`);
           });
         });
 

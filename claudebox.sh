@@ -243,7 +243,12 @@ while [[ $# -gt 0 ]]; do
       [[ -n "${2:-}" && "$2" =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo "❌ --nvidia-devices: expected comma-separated GPU indices (e.g. 0,1,3)"; exit 1; }
       SHARE_NVIDIA=true; NVIDIA_DEVICES=$2; shift 2 ;;
     --proxy-only)       PROXY_ONLY=true; shift ;;
-    --proxy-command)    PROXY_COMMAND=$2; shift 2 ;;
+    --proxy-command)
+      # SEC: reject null bytes and control characters (except common whitespace: tab, newline, CR)
+      if [[ "$2" =~ [$'\x00'-$'\x08'$'\x0e'-$'\x1f'$'\x7f'] ]]; then
+        echo "❌ --proxy-command: rejected (contains control characters)"; exit 1
+      fi
+      PROXY_COMMAND=$2; shift 2 ;;
     --proxy-service)
       [[ "$2" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "❌ --proxy-service: invalid service name '$2'"; exit 1; }
       PROXY_SERVICES+=("$2"); shift 2 ;;
