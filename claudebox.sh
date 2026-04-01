@@ -726,6 +726,13 @@ WORKDIR=$(realpath --canonicalize-existing "$WORKDIR" 2>/dev/null) || {
 [[ "$SNAPSHOT" == true && "$READONLY_WORKDIR" == true ]] && {
   echo "❌ --snapshot and --read-only-workdir are mutually exclusive"; exit 1; }
 
+# When sharing sessions, use the real host workdir path inside the sandbox so
+# that Claude Code writes the same cwd into session JSONL files.  This makes
+# --continue / --resume work across host ↔ sandbox boundaries.
+if [[ "$SHARE_SESSIONS" == true ]]; then
+  SANDBOX_WORKDIR="$WORKDIR"
+fi
+
 # ---------------------------------------------------------------------------
 # Snapshot: copy workdir to staging area (sandbox writes to staging, original safe)
 # ---------------------------------------------------------------------------
@@ -1827,15 +1834,12 @@ fi
 # Session sharing: bind-mount project-specific conversation data (rw) so that
 # sessions can be resumed from the host or another sandbox.
 # Claude Code stores sessions in ~/.claude/projects/<project-dir-name>/.
-# Use separate host and sandbox project names so the host session directory
-# stays stable while the sandbox path matches the visible mountpoint.
+# Because SANDBOX_WORKDIR == WORKDIR when --share-sessions is set, the project
+# dir name is identical on both sides, enabling seamless --continue / --resume.
 if [[ "$SHARE_SESSIONS" == true ]]; then
-  # Host key: /home/user/work/foo -> -home-user-work-foo
-  _host_project_dir_name=$(echo "$WORKDIR" | tr '/' '-')
-  # Sandbox key follows the path Claude sees, e.g. /workspace -> -workspace.
-  _sandbox_project_dir_name=$(echo "$SANDBOX_WORKDIR" | tr '/' '-')
-  _host_project_dir="$HOME/.claude/projects/$_host_project_dir_name"
-  _sandbox_project_dir="$SANDBOX_HOME/.claude/projects/$_sandbox_project_dir_name"
+  _project_dir_name=$(echo "$WORKDIR" | tr '/' '-')
+  _host_project_dir="$HOME/.claude/projects/$_project_dir_name"
+  _sandbox_project_dir="$SANDBOX_HOME/.claude/projects/$_project_dir_name"
 
   # Create host-side directories if they don't exist
   mkdir -p "$_host_project_dir"
@@ -1859,7 +1863,7 @@ if [[ "$SHARE_SESSIONS" == true ]]; then
     BWRAP+=(--ro-bind "$HOME/.claude/history.jsonl" "$SANDBOX_HOME/.claude/history.jsonl")
   fi
 
-  echo "✔ Session sharing enabled (host: $_host_project_dir_name, sandbox: $_sandbox_project_dir_name)"
+  echo "✔ Session sharing enabled (project: $_project_dir_name, sandbox workdir: $SANDBOX_WORKDIR)"
   # HIGH-2: warn about session resume risk — sandboxed code can write crafted
   # JSONL that replays on the host when resumed without a sandbox.
   echo "  ⚠ When resuming shared sessions on the host, review conversation history first."

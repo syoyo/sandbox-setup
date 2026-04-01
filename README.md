@@ -328,6 +328,11 @@ By default, each sandbox starts with a fresh `~/.claude` directory and no conver
 history. Use `--share-sessions` to persist session data so you can resume conversations
 from the host or another sandbox.
 
+When `--share-sessions` is enabled, the working directory is mounted at its **real host
+path** inside the sandbox (instead of `/workspace`). This ensures Claude Code writes the
+same `cwd` into session files, making `--continue` and `--resume` work seamlessly across
+host and sandbox boundaries.
+
 ```bash
 # Start a sandbox with session sharing
 ./claudebox.sh --share-sessions --workdir ~/projects/myapp
