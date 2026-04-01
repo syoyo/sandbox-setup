@@ -69,11 +69,12 @@ SHARE_SESSIONS=false
 ISOLATE_NET=true
 BIND_BINARIES=false
 LAUNCH_SHELL=false
+LAUNCHER="claude"      # command to launch inside sandbox: claude | codex
 ENABLE_GITHUB=false
 ENABLE_GITHUB_MCP=false
 AUTO_REFRESH_AUTH=true
 PORT_MCP=58082             # in-sandbox TCP port for MCP bridge
-PORT_SLACK=58083           # in-sandbox TCP port for Slack webhook proxy
+PORT_SLACK=58084           # in-sandbox TCP port for Slack webhook proxy
 HOST_PORT_MCP_SERVER=""
 MCP_SERVER_PID=""
 CLAUDE_ARGS=()
@@ -166,6 +167,9 @@ while [[ $# -gt 0 ]]; do
     --share-network)     ISOLATE_NET=false; shift ;;
     --bind-binaries)     BIND_BINARIES=true; shift ;;
     --shell)             LAUNCH_SHELL=true; shift ;;
+    --launcher)
+      [[ "$2" =~ ^(claude|codex)$ ]] || { echo "❌ --launcher: expected claude or codex (got '$2')"; exit 1; }
+      LAUNCHER=$2; shift 2 ;;
     --dummy-credentials) DUMMY_CREDS_FILE=$2; shift 2 ;;
     --workdir)           WORKDIR=$2; shift 2 ;;
     --sandbox-home)      SANDBOX_HOME_SEED=$2; shift 2 ;;
@@ -271,12 +275,13 @@ while [[ $# -gt 0 ]]; do
       PORT_GITHUB_CONNECT=$2; shift 2 ;;
     --help|-h)
       cat <<'EOF'
-claudebox.sh — Run Claude Code in a bwrap sandbox with host-side credential proxy
+claudebox.sh — Run Claude Code or Codex in a bwrap sandbox with host-side credential proxy
 
 USAGE:
-  claudebox.sh [OPTIONS] [-- CLAUDE_ARGS...]
+  claudebox.sh [OPTIONS] [-- TOOL_ARGS...]
 
 OPTIONS:
+  --launcher NAME       Which CLI to run inside the sandbox: claude (default) or codex.
   --share-claude-dir     Seed the sandbox with your host ~/.claude contents (history, settings, etc.)
                          The host directory stays protected; .credentials.json is replaced with dummies.
   --share-sessions       Share session data (read-write) so conversations can be resumed
@@ -286,9 +291,9 @@ OPTIONS:
   --share-network        Share host network namespace (weaker isolation; default: isolated).
                          Default (isolated) requires on Ubuntu 22.04+:
                            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-  --bind-binaries        Bind-mount node and claude from their host paths into the sandbox
-                         under /run/sandbox-bin. Use this when they live outside /usr.
-  --shell                Launch bash instead of claude (useful for debugging the sandbox).
+  --bind-binaries        Bind-mount node plus the selected launcher from host paths into
+                         the sandbox. Required when they live outside /usr.
+  --shell                Launch bash instead of the selected launcher (useful for debugging).
   --dummy-credentials FILE  Use FILE as the dummy .credentials.json.
   --workdir DIR          Working directory to mount read-write (default: CWD).
                          Must be an existing path; symlinks are resolved.
@@ -350,7 +355,7 @@ OPTIONS:
   --notify-command CMD   Run CMD on events (env: CLAUDEBOX_EVENT, CLAUDEBOX_MESSAGE).
   --notify-webhook URL   POST JSON to URL on events (Slack incoming webhook compatible).
   --slack-webhook URL    Proxy Slack webhook into sandbox (URL stays on host).
-                         Inside sandbox: curl -X POST -d '{"text":"hi"}' http://127.0.0.1:58083
+                         Inside sandbox: curl -X POST -d '{"text":"hi"}' http://127.0.0.1:58084
   --anthropic-port PORT  TCP port for Anthropic proxy bridge (default: 58080; range 1024-65535)
   --github-port PORT     TCP port for GitHub CONNECT proxy (default: 58081; range 1024-65535)
   --help                 Show this help
@@ -387,6 +392,20 @@ EOF
   esac
 done
 
+if [[ "$LAUNCHER" == "codex" ]]; then
+  _has_openai_proxy=false
+  for _svc in "${PROXY_SERVICES[@]+"${PROXY_SERVICES[@]}"}"; do
+    if [[ "$_svc" == "openai" ]]; then
+      _has_openai_proxy=true
+      break
+    fi
+  done
+  if [[ "$_has_openai_proxy" != true ]]; then
+    PROXY_SERVICES+=("openai")
+    echo "✔ Added --proxy-service openai for codex launcher"
+  fi
+fi
+
 # ---------------------------------------------------------------------------
 # Attach socket directory (shared between host and sandbox for shell access)
 # ---------------------------------------------------------------------------
@@ -406,7 +425,7 @@ shell_join() {
 # SEC: safe metadata loader — only accepts VAR=VALUE lines (no command execution).
 # Replaces `source` to prevent arbitrary code execution from crafted metadata files.
 # Only whitelisted variable names are accepted to prevent overwriting critical vars.
-_METADATA_ALLOWED_KEYS="SANDBOX_ID WORKDIR_PATH WORKSPACE_NAME STARTED_AT ATTACH_SOCKET SANDBOX_PID LAUNCH_MODE NETWORK_MODE SHARE_SESSIONS_MODE SHARE_CLAUDE_DIR_MODE BIND_BINARIES_MODE ENABLE_GITHUB_MCP_MODE ENABLE_GITHUB_MODE READONLY_WORKDIR_MODE SNAPSHOT_MODE IMAGE_ROOT PORT_ANTHROPIC_META PORT_GITHUB_META PORT_MCP_META HOST_PORT_ANTHROPIC_META HOST_PORT_GITHUB_META HOST_PORT_MCP_SERVER_META CLAUDEBOX_ARGS_SHELL CLAUDE_ARGS_SHELL"
+_METADATA_ALLOWED_KEYS="SANDBOX_ID WORKDIR_PATH WORKSPACE_NAME STARTED_AT ATTACH_SOCKET SANDBOX_PID LAUNCH_MODE LAUNCHER_NAME NETWORK_MODE SHARE_SESSIONS_MODE SHARE_CLAUDE_DIR_MODE BIND_BINARIES_MODE ENABLE_GITHUB_MCP_MODE ENABLE_GITHUB_MODE READONLY_WORKDIR_MODE SNAPSHOT_MODE IMAGE_ROOT PORT_ANTHROPIC_META PORT_GITHUB_META PORT_MCP_META HOST_PORT_ANTHROPIC_META HOST_PORT_GITHUB_META HOST_PORT_MCP_SERVER_META CLAUDEBOX_ARGS_SHELL TOOL_ARGS_SHELL"
 
 load_metadata() {
   local file="$1" line key val
@@ -531,11 +550,11 @@ print_sandbox_list() {
 
 print_sandbox_info() {
   local meta="$1"
-  unset SANDBOX_ID WORKDIR_PATH WORKSPACE_NAME STARTED_AT ATTACH_SOCKET SANDBOX_PID LAUNCH_MODE NETWORK_MODE
+  unset SANDBOX_ID WORKDIR_PATH WORKSPACE_NAME STARTED_AT ATTACH_SOCKET SANDBOX_PID LAUNCH_MODE LAUNCHER_NAME NETWORK_MODE
   unset SHARE_SESSIONS_MODE SHARE_CLAUDE_DIR_MODE BIND_BINARIES_MODE ENABLE_GITHUB_MCP_MODE ENABLE_GITHUB_MODE
   unset READONLY_WORKDIR_MODE SNAPSHOT_MODE IMAGE_ROOT PORT_ANTHROPIC_META PORT_GITHUB_META PORT_MCP_META
   unset HOST_PORT_ANTHROPIC_META HOST_PORT_GITHUB_META HOST_PORT_MCP_SERVER_META
-  unset CLAUDE_ARGS_SHELL CLAUDEBOX_ARGS_SHELL
+  unset TOOL_ARGS_SHELL CLAUDEBOX_ARGS_SHELL
   load_metadata "$meta"
   _status="stopped"
   if [[ -n "${ATTACH_SOCKET:-}" && -S "${ATTACH_SOCKET:-}" ]]; then
@@ -552,6 +571,7 @@ Started: ${STARTED_AT:-unknown}
 Attach socket: ${ATTACH_SOCKET:-unknown}
 Sandbox PID: ${SANDBOX_PID:-unknown}
 Launch mode: ${LAUNCH_MODE:-unknown}
+Launcher: ${LAUNCHER_NAME:-unknown}
 Network: ${NETWORK_MODE:-unknown}
 Share sessions: ${SHARE_SESSIONS_MODE:-unknown}
 Share .claude: ${SHARE_CLAUDE_DIR_MODE:-unknown}
@@ -564,7 +584,7 @@ Image rootfs: ${IMAGE_ROOT:-none}
 Ports: anthropic=${PORT_ANTHROPIC_META:-unknown} github=${PORT_GITHUB_META:-unknown} mcp=${PORT_MCP_META:-unknown}
 Host ports: anthropic=${HOST_PORT_ANTHROPIC_META:-unknown} github=${HOST_PORT_GITHUB_META:-unknown} mcp-server=${HOST_PORT_MCP_SERVER_META:-unknown}
 claudebox args: ${CLAUDEBOX_ARGS_SHELL:-}
-claude args: ${CLAUDE_ARGS_SHELL:-}
+tool args: ${TOOL_ARGS_SHELL:-}
 EOF
 }
 
@@ -807,12 +827,28 @@ resolve_bin() {
 }
 
 NODE_BIN=""
-CLAUDE_BIN=""
+LAUNCHER_BIN=""
+LAUNCHER_PREFIX=""
+LAUNCHER_PREFIX_BIN=false
 if [[ "$BIND_BINARIES" == true ]]; then
   NODE_BIN=$(resolve_bin node)
-  CLAUDE_BIN=$(resolve_bin claude)
-  [[ -n "$NODE_BIN"   ]] || { echo "❌ node binary not found";   exit 1; }
-  [[ -n "$CLAUDE_BIN" ]] || { echo "❌ claude binary not found"; exit 1; }
+  [[ -n "$NODE_BIN" ]] || { echo "❌ node binary not found"; exit 1; }
+
+  if [[ "$LAUNCHER" == "codex" ]]; then
+    _launcher_cmd=$(command -v codex 2>/dev/null || true)
+    [[ -n "$_launcher_cmd" ]] || { echo "❌ codex binary not found"; exit 1; }
+    _launcher_prefix=$(cd "$(dirname "$_launcher_cmd")/.." && pwd)
+    if [[ -d "$_launcher_prefix/lib/node_modules/@openai/codex" ]]; then
+      LAUNCHER_PREFIX="$_launcher_prefix"
+      LAUNCHER_PREFIX_BIN=true
+    else
+      LAUNCHER_BIN=$(resolve_bin codex)
+      [[ -n "$LAUNCHER_BIN" ]] || { echo "❌ codex binary not found"; exit 1; }
+    fi
+  else
+    LAUNCHER_BIN=$(resolve_bin "$LAUNCHER")
+    [[ -n "$LAUNCHER_BIN" ]] || { echo "❌ $LAUNCHER binary not found"; exit 1; }
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -1179,6 +1215,8 @@ if [[ "$PROXY_ONLY" == true ]]; then
   # Set up a temporary .claude directory with dummy credentials
   _PROXY_ONLY_CLAUDE_DIR=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/claudebox-proxy-only-XXXXXX")
   chmod 700 "$_PROXY_ONLY_CLAUDE_DIR"
+  _PROXY_ONLY_CODEX_HOME=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/codex-proxy-only-XXXXXX")
+  chmod 700 "$_PROXY_ONLY_CODEX_HOME"
 
   # Copy relevant .claude files (settings, CLAUDE.md, etc.)
   if [[ -d "$HOME/.claude" ]]; then
@@ -1197,10 +1235,19 @@ if [[ "$PROXY_ONLY" == true ]]; then
   # Place dummy credentials
   cp "$TEMP_CREDS" "$_PROXY_ONLY_CLAUDE_DIR/.credentials.json"
 
+  if [[ -d "$HOME/.codex" ]]; then
+    [[ -f "$HOME/.codex/config.toml" ]] && cp "$HOME/.codex/config.toml" "$_PROXY_ONLY_CODEX_HOME/"
+    if [[ "$SHARE_SESSIONS" == true && -d "$HOME/.codex/sessions" ]]; then
+      cp -r "$HOME/.codex/sessions" "$_PROXY_ONLY_CODEX_HOME/"
+    fi
+    [[ -f "$HOME/.codex/history.jsonl" ]] && cp "$HOME/.codex/history.jsonl" "$_PROXY_ONLY_CODEX_HOME/"
+  fi
+
   # Build environment for the proxied command
   _PROXY_ENV=(
     ANTHROPIC_BASE_URL="http://127.0.0.1:$HOST_PORT_ANTHROPIC"
     CLAUDE_CONFIG_DIR="$_PROXY_ONLY_CLAUDE_DIR"
+    CODEX_HOME="$_PROXY_ONLY_CODEX_HOME"
     NO_PROXY="127.0.0.1,localhost,::1"
     HTTP_PROXY=""
     ALL_PROXY=""
@@ -1215,6 +1262,7 @@ if [[ "$PROXY_ONLY" == true ]]; then
   if [[ "$_HAS_OPENAI" == true ]]; then
     _PROXY_ENV+=(
       OPENAI_BASE_URL="http://127.0.0.1:$HOST_PORT_OPENAI"
+      OPENAI_BASE_URI="http://127.0.0.1:$HOST_PORT_OPENAI"
       OPENAI_API_KEY="$SESSION_DUMMY_TOKEN"
     )
     echo "  OpenAI proxy: http://127.0.0.1:$HOST_PORT_OPENAI"
@@ -1245,6 +1293,7 @@ MCPEOF
   echo "  Workdir: $WORKDIR [$_rw_desc]"
   echo "  Anthropic proxy: http://127.0.0.1:$HOST_PORT_ANTHROPIC"
   echo "  Config dir: $_PROXY_ONLY_CLAUDE_DIR"
+  [[ "$LAUNCHER" == "codex" ]] && echo "  Codex home: $_PROXY_ONLY_CODEX_HOME"
   notify sandbox_start ":rocket: Proxy-only started — workdir: \`$(basename "$WORKDIR")\` [$_rw_desc], PID: $$"
 
   # Handle snapshot mode in proxy-only (copy workdir, run there, merge back)
@@ -1260,7 +1309,7 @@ MCPEOF
     (cd "$_PROXY_WORKDIR" && env "${_PROXY_ENV[@]}" bash) || PROXY_ONLY_EXIT=$?
   else
     echo "  Ctrl-C terminates the process"
-    (cd "$_PROXY_WORKDIR" && env "${_PROXY_ENV[@]}" claude "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}") || PROXY_ONLY_EXIT=$?
+    (cd "$_PROXY_WORKDIR" && env "${_PROXY_ENV[@]}" "$LAUNCHER" "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}") || PROXY_ONLY_EXIT=$?
   fi
 
   # Post-exit: diff, quarantine, snapshot merge
@@ -1275,7 +1324,15 @@ MCPEOF
     echo "✔ Session data synced back"
   fi
 
+  if [[ "$SHARE_SESSIONS" == true && -d "$_PROXY_ONLY_CODEX_HOME/sessions" ]]; then
+    mkdir -p "$HOME/.codex/sessions"
+    cp -r "$_PROXY_ONLY_CODEX_HOME/sessions/." "$HOME/.codex/sessions/" 2>/dev/null || true
+    [[ -f "$_PROXY_ONLY_CODEX_HOME/history.jsonl" ]] && cp "$_PROXY_ONLY_CODEX_HOME/history.jsonl" "$HOME/.codex/history.jsonl" 2>/dev/null || true
+    echo "✔ Codex session data synced back"
+  fi
+
   rm -rf "$_PROXY_ONLY_CLAUDE_DIR" 2>/dev/null || true
+  rm -rf "$_PROXY_ONLY_CODEX_HOME" 2>/dev/null || true
   notify sandbox_exit ":stop_sign: Proxy-only exited (code: $PROXY_ONLY_EXIT, workdir: \`$(basename "$WORKDIR")\`)"
   exit "$PROXY_ONLY_EXIT"
 fi
@@ -1307,7 +1364,7 @@ WORKSPACE_NAME="$(basename "$WORKDIR")"
 STARTED_AT="$(date -Is)"
 SANDBOX_ID="$(allocate_sandbox_id)"
 CLAUDEBOX_ARGS_SHELL="$(shell_join "${ORIGINAL_ARGS[@]}")"
-CLAUDE_ARGS_SHELL="$(shell_join "${CLAUDE_ARGS[@]}")"
+TOOL_ARGS_SHELL="$(shell_join "${CLAUDE_ARGS[@]}")"
 cat > "$METADATA_FILE" <<EOF
 SANDBOX_ID=$(printf '%q' "$SANDBOX_ID")
 WORKDIR_PATH=$(printf '%q' "$WORKDIR")
@@ -1315,7 +1372,8 @@ WORKSPACE_NAME=$(printf '%q' "$WORKSPACE_NAME")
 STARTED_AT=$(printf '%q' "$STARTED_AT")
 ATTACH_SOCKET=$(printf '%q' "$ATTACH_SOCK")
 SANDBOX_PID=$(printf '%q' "")
-LAUNCH_MODE=$(printf '%q' "$([[ "$LAUNCH_SHELL" == true ]] && echo shell || echo claude)")
+LAUNCH_MODE=$(printf '%q' "$([[ "$LAUNCH_SHELL" == true ]] && echo shell || echo "$LAUNCHER")")
+LAUNCHER_NAME=$(printf '%q' "$LAUNCHER")
 NETWORK_MODE=$(printf '%q' "$([[ "$ISOLATE_NET" == true ]] && echo isolated || echo shared)")
 SHARE_SESSIONS_MODE=$(printf '%q' "$SHARE_SESSIONS")
 SHARE_CLAUDE_DIR_MODE=$(printf '%q' "$SHARE_CLAUDE_DIR")
@@ -1332,7 +1390,7 @@ HOST_PORT_ANTHROPIC_META=$(printf '%q' "$HOST_PORT_ANTHROPIC")
 HOST_PORT_GITHUB_META=$(printf '%q' "$HOST_PORT_GITHUB_CONNECT")
 HOST_PORT_MCP_SERVER_META=$(printf '%q' "$HOST_PORT_MCP_SERVER")
 CLAUDEBOX_ARGS_SHELL=$(printf '%q' "$CLAUDEBOX_ARGS_SHELL")
-CLAUDE_ARGS_SHELL=$(printf '%q' "$CLAUDE_ARGS_SHELL")
+TOOL_ARGS_SHELL=$(printf '%q' "$TOOL_ARGS_SHELL")
 EOF
 
 # Common host /etc paths needed for networking, SSL, and time
@@ -1451,6 +1509,7 @@ BWRAP=(
   --setenv HTTP_PROXY  ""
   --setenv ALL_PROXY   ""
   --setenv NO_PROXY    "127.0.0.1,localhost,::1"
+  --setenv CODEX_HOME  "$SANDBOX_HOME/.codex"
   # MED-6: disable git hooks via read-only system gitconfig to prevent
   # network isolation bypass.  Env vars (GIT_CONFIG_COUNT) are bypassable
   # by sandbox code; a ro-bind gitconfig file cannot be overridden.
@@ -1464,6 +1523,7 @@ BWRAP=(
   --setenv _GITHUB_PORT      "$PORT_GITHUB_CONNECT"
   --setenv _ISOLATE_NET      "$ISOLATE_NET"
   --setenv _ENABLE_GITHUB    "$ENABLE_GITHUB"
+  --setenv _LAUNCHER         "$LAUNCHER"
   --setenv _LAUNCH_SHELL     "$LAUNCH_SHELL"
   --setenv _SHARE_SESSIONS   "$SHARE_SESSIONS"
 
@@ -1482,6 +1542,30 @@ if [[ -n "$CACHE_HOME" ]]; then
   BWRAP+=(--dir /home --bind "$CACHE_HOME" "$SANDBOX_HOME")
 else
   BWRAP+=(--tmpfs /home --dir "$SANDBOX_HOME")
+fi
+
+# Minimal Codex home wiring: keep auth out of the sandbox, but preserve config
+# and optionally session/history state needed for resume flows.
+if [[ -n "$CACHE_HOME" ]]; then
+  mkdir -p "$CACHE_HOME/.codex"
+else
+  BWRAP+=(--dir "$SANDBOX_HOME/.codex")
+fi
+if [[ -f "$HOME/.codex/config.toml" ]]; then
+  BWRAP+=(--ro-bind "$HOME/.codex/config.toml" "$SANDBOX_HOME/.codex/config.toml")
+fi
+if [[ "$SHARE_SESSIONS" == true ]]; then
+  mkdir -p "$HOME/.codex/sessions"
+  [[ -n "$CACHE_HOME" ]] && mkdir -p "$CACHE_HOME/.codex/sessions"
+  [[ -z "$CACHE_HOME" ]] && BWRAP+=(--dir "$SANDBOX_HOME/.codex/sessions")
+  BWRAP+=(--bind "$HOME/.codex/sessions" "$SANDBOX_HOME/.codex/sessions")
+  if [[ -f "$HOME/.codex/history.jsonl" ]]; then
+    BWRAP+=(--ro-bind "$HOME/.codex/history.jsonl" "$SANDBOX_HOME/.codex/history.jsonl")
+  fi
+  if [[ "$LAUNCHER" == "codex" ]]; then
+    echo "✔ Codex session sharing enabled"
+    echo "  ⚠ Shared Codex session files are writable from the sandbox."
+  fi
 fi
 
 # Workdir bind mount: snapshot (staging copy), ro, or rw
@@ -1525,6 +1609,7 @@ if [[ "$_HAS_OPENAI" == true ]]; then
   BWRAP+=(
     --ro-bind "$SOCKET_OPENAI" "$SANDBOX_SOCKET_OPENAI"
     --setenv OPENAI_BASE_URL "http://127.0.0.1:$PORT_OPENAI"
+    --setenv OPENAI_BASE_URI "http://127.0.0.1:$PORT_OPENAI"
     --setenv OPENAI_API_KEY "$SESSION_DUMMY_TOKEN"
     --setenv _OPENAI_SOCK "$SANDBOX_SOCKET_OPENAI"
     --setenv _OPENAI_PORT "$PORT_OPENAI"
@@ -1737,22 +1822,22 @@ if [[ "$SHARE_SESSIONS" == true ]]; then
   echo "  ⚠ When resuming shared sessions on the host, review conversation history first."
 fi
 
-# HIGH-5: only bind ~/.local/bin/claude if it is owned by the current user
+# HIGH-5: only bind ~/.local/bin/<launcher> if it is owned by the current user
 # with no group/world write permission.
-SANDBOX_CLAUDE_BIN="$HOME/.local/bin/claude"
-if [[ -f "$SANDBOX_CLAUDE_BIN" ]]; then
-  _claude_bind_src=$(realpath --canonicalize-existing "$SANDBOX_CLAUDE_BIN" 2>/dev/null || echo "$SANDBOX_CLAUDE_BIN")
-  _bin_owner=$(stat -c '%U' "$_claude_bind_src" 2>/dev/null || echo "")
-  _bin_mode=$(stat -c '%a'  "$_claude_bind_src" 2>/dev/null || echo "777")
+SANDBOX_LAUNCHER_LOCAL_BIN="$HOME/.local/bin/$LAUNCHER"
+if [[ -f "$SANDBOX_LAUNCHER_LOCAL_BIN" ]]; then
+  _launcher_bind_src=$(realpath --canonicalize-existing "$SANDBOX_LAUNCHER_LOCAL_BIN" 2>/dev/null || echo "$SANDBOX_LAUNCHER_LOCAL_BIN")
+  _bin_owner=$(stat -c '%U' "$_launcher_bind_src" 2>/dev/null || echo "")
+  _bin_mode=$(stat -c '%a'  "$_launcher_bind_src" 2>/dev/null || echo "777")
   _bin_mode_octal=$((8#$_bin_mode))
   if [[ "$_bin_owner" == "$(id -un)" ]] && (( (_bin_mode_octal & 8#022) == 0 )); then
     BWRAP+=(
       --dir "$SANDBOX_HOME/.local"
       --dir "$SANDBOX_HOME/.local/bin"
-      --ro-bind "$_claude_bind_src" "$SANDBOX_HOME/.local/bin/claude"
+      --ro-bind "$_launcher_bind_src" "$SANDBOX_HOME/.local/bin/$LAUNCHER"
     )
   else
-    echo "⚠ Skipping ~/.local/bin/claude bind: target not owned by current user or group/world-writable ($_claude_bind_src, mode=$_bin_mode)"
+    echo "⚠ Skipping ~/.local/bin/$LAUNCHER bind: target not owned by current user or group/world-writable ($_launcher_bind_src, mode=$_bin_mode)"
   fi
 fi
 
@@ -1899,9 +1984,14 @@ fi
 if [[ "$BIND_BINARIES" == true ]]; then
   BWRAP+=(
     --dir /run/sandbox-bin
-    --ro-bind "$NODE_BIN"   /run/sandbox-bin/node
-    --ro-bind "$CLAUDE_BIN" /run/sandbox-bin/claude
+    --ro-bind "$NODE_BIN" /run/sandbox-bin/node
   )
+  if [[ "$LAUNCHER_PREFIX_BIN" == true ]]; then
+    BWRAP+=(--ro-bind "$LAUNCHER_PREFIX" "$LAUNCHER_PREFIX")
+    _EXTRA_PATH+=("$LAUNCHER_PREFIX/bin")
+  else
+    BWRAP+=(--ro-bind "$LAUNCHER_BIN" "/run/sandbox-bin/$LAUNCHER")
+  fi
   _EXTRA_PATH+=("/run/sandbox-bin")
 fi
 
@@ -2032,6 +2122,7 @@ SANDBOX_INIT_SCRIPT='
     cp --no-dereference --no-preserve=mode,ownership /run/dummy-claude-credentials.json "$HOME/.claude/.credentials.json"
   fi
 
+  mkdir -p "$CODEX_HOME"
   printf '\''{"hasCompletedOnboarding": true, "installMethod": "native"}'\'' > "$HOME/.claude.json"
 
   # Start in-sandbox TCP bridges for proxy sockets.
@@ -2145,12 +2236,13 @@ MCPEOF
 
   # Save _LAUNCH_SHELL before cleaning up internal init vars.
   _ls="$_LAUNCH_SHELL"
-  unset _PROXY_SOCK _PROXY_PORT _GITHUB_SOCK _GITHUB_PORT _ISOLATE_NET _ENABLE_GITHUB _LAUNCH_SHELL _SHARE_SESSIONS _ENABLE_GITHUB_MCP _MCP_SOCK _MCP_PORT _MCP_DUMMY_TOKEN _HAS_OPENAI _OPENAI_SOCK _OPENAI_PORT _ENABLE_SLACK _SLACK_SOCK _SLACK_PORT
+  _launcher="$_LAUNCHER"
+  unset _PROXY_SOCK _PROXY_PORT _GITHUB_SOCK _GITHUB_PORT _ISOLATE_NET _ENABLE_GITHUB _LAUNCHER _LAUNCH_SHELL _SHARE_SESSIONS _ENABLE_GITHUB_MCP _MCP_SOCK _MCP_PORT _MCP_DUMMY_TOKEN _HAS_OPENAI _OPENAI_SOCK _OPENAI_PORT _ENABLE_SLACK _SLACK_SOCK _SLACK_PORT
 
   if [[ "$_ls" == true ]]; then
     exec bash
   else
-    exec claude "$@"
+    exec "$_launcher" "$@"
   fi
 '
 

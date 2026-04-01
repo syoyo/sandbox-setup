@@ -1,6 +1,6 @@
 # claudebox
 
-Run [Claude Code](https://docs.anthropic.com/en/docs/claude-code) in a [bubblewrap](https://github.com/containers/bubblewrap) sandbox with a host-side credential proxy.
+Run [Claude Code](https://docs.anthropic.com/en/docs/claude-code) or OpenAI Codex in a [bubblewrap](https://github.com/containers/bubblewrap) sandbox with a host-side credential proxy.
 
 Real API credentials stay on the host. The sandbox only sees dummy tokens, which the host-side proxy replaces with real ones before forwarding to upstream APIs. The sandbox process never sees real credentials.
 
@@ -84,6 +84,12 @@ sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 # Pass arguments to claude
 ./claudebox.sh -- -p "explain this codebase"
 
+# Run Codex instead of Claude
+./claudebox.sh --launcher codex --bind-binaries -- --help
+
+# Run Codex with the OpenAI proxy bridge
+OPENAI_API_KEY=sk-xxx ./claudebox.sh --launcher codex --bind-binaries
+
 # Open a shell inside the sandbox (for debugging)
 ./claudebox.sh --shell
 
@@ -138,7 +144,8 @@ OPENAI_API_KEY=sk-xxx ./claudebox.sh --proxy-only --proxy-service openai --shell
 ```
 --workdir DIR          Working directory to mount read-write (default: CWD).
                        Symlinks are resolved. Cannot be / or $HOME.
---shell                Launch bash instead of claude (useful for debugging).
+--shell                Launch bash instead of the selected CLI (useful for debugging).
+--launcher NAME        Select the CLI to run inside the sandbox: claude (default) or codex.
 --attach               Attach to a running sandbox from another terminal.
 --mount-claude-md      Mount ~/.claude/CLAUDE.md into sandbox (read-only).
 --share-claude-dir     Seed sandbox ~/.claude from the host (credentials replaced with dummies).
@@ -150,7 +157,7 @@ OPENAI_API_KEY=sk-xxx ./claudebox.sh --proxy-only --proxy-service openai --shell
 --mcp-port PORT        TCP port for MCP server bridge (default: 58082).
 --disable-github       Explicitly disable GitHub access (default).
 --share-network        Share host network namespace (weaker isolation; default: isolated).
---bind-binaries        Bind-mount node and claude from host paths into /run/sandbox-bin.
+--bind-binaries        Bind-mount node plus the selected CLI from host paths into the sandbox.
 --dummy-credentials F  Use FILE as the dummy .credentials.json.
 --mem-limit SIZE       Memory limit, e.g. 4G, 512M (uses cgroups via systemd-run).
 --cpu-limit PERCENT    CPU limit as percentage: 100 = 1 core, 200 = 2 cores, etc.
