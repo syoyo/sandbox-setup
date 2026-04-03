@@ -106,6 +106,7 @@ CACHE_HOME=""          # cache directory for sandbox home state
 SECCOMP=false          # enable seccomp syscall filter
 IMAGE=""               # container image root filesystem (extracted rootfs directory)
 SHARE_ROCM=false       # share ROCm GPU devices (/dev/kfd, /dev/dri) into the sandbox
+SHARE_AMD=false        # share AMD GPU: ROCm + Vulkan (implies --share-rocm)
 SHARE_NVIDIA=false     # share NVIDIA GPU devices (/dev/nvidia*) into the sandbox
 NVIDIA_DEVICES=""      # comma-separated GPU indices to expose (empty = all)
 PROXY_ONLY=false       # proxy-only mode: no bwrap/cgroups, just credential proxy + env
@@ -242,6 +243,7 @@ while [[ $# -gt 0 ]]; do
       [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1 )) || { echo "❌ --timeout: invalid value '$2' (minutes, >= 1)"; exit 1; }
       WALL_TIMEOUT=$2; shift 2 ;;
     --share-rocm)        SHARE_ROCM=true; shift ;;
+    --share-amd)         SHARE_AMD=true; SHARE_ROCM=true; shift ;;
     --share-nvidia)      SHARE_NVIDIA=true; shift ;;
     --nvidia-devices)
       [[ -n "${2:-}" && "$2" =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo "❌ --nvidia-devices: expected comma-separated GPU indices (e.g. 0,1,3)"; exit 1; }
@@ -344,6 +346,9 @@ OPTIONS:
   --share-rocm           Share ROCm GPU devices (/dev/kfd, /dev/dri) into the sandbox.
                          Also exposes /sys/class/kfd, /sys/devices (for GPU topology),
                          and /opt/rocm (ROCm libraries, if present).
+  --share-amd            Share AMD GPU with ROCm + Vulkan support. Implies --share-rocm
+                         and additionally exposes Vulkan ICD/layer configs and sets
+                         VK_DRIVER_FILES to use the RADV Vulkan driver.
   --share-nvidia         Share NVIDIA GPU devices (/dev/nvidia*) into the sandbox.
                          Also exposes /dev/nvidiactl, /dev/nvidia-uvm, CUDA libraries,
                          and nvidia-smi. By default exposes all GPUs; use --nvidia-devices
@@ -1733,6 +1738,24 @@ if [[ "$SHARE_ROCM" == true ]]; then
   fi
   echo "✔ ROCm GPU devices shared into sandbox"
   echo "  ⚠ GPU devices are shared read-write (--dev-bind); sandboxed code has full ioctl access."
+fi
+
+# AMD Vulkan passthrough (added on top of ROCm when --share-amd is used)
+if [[ "$SHARE_AMD" == true ]]; then
+  # /etc/vulkan — ICD and layer configuration (not bound by default)
+  [[ -d /etc/vulkan ]] && BWRAP+=(--ro-bind /etc/vulkan /etc/vulkan)
+  # /usr/share/vulkan is already available via /usr ro-bind
+  # /usr/share/drirc.d — RADV driver defaults
+  [[ -d /usr/share/drirc.d ]] && BWRAP+=(--ro-bind /usr/share/drirc.d /usr/share/drirc.d)
+  # Point Vulkan loader directly at the RADV (AMD) ICD
+  if [[ -f /usr/share/vulkan/icd.d/radeon_icd.json ]]; then
+    BWRAP+=(--setenv VK_DRIVER_FILES "/usr/share/vulkan/icd.d/radeon_icd.json")
+  elif [[ -f /etc/vulkan/icd.d/radeon_icd.json ]]; then
+    BWRAP+=(--setenv VK_DRIVER_FILES "/etc/vulkan/icd.d/radeon_icd.json")
+  else
+    echo "⚠ --share-amd: radeon_icd.json not found; Vulkan loader will scan all ICDs"
+  fi
+  echo "✔ AMD Vulkan support shared into sandbox (ROCm + Vulkan)"
 fi
 
 # NVIDIA GPU passthrough: bind-mount /dev/nvidia*, CUDA libs, and nvidia-smi
