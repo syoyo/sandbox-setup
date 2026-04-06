@@ -73,6 +73,7 @@ sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 | `claudebox.sh` | Sandbox launcher (bwrap + systemd-run) |
 | `claudebox-supervisor.sh` | Multi-sandbox orchestrator for parallel tasks |
 | `credential-proxy.js` | Host-side credential injection proxy + CONNECT proxy |
+| `run-credential-proxy.sh` | Standalone proxy launcher (no sandbox) |
 | `run-example.sh` | Example invocations |
 
 ## Quick Start
@@ -179,6 +180,9 @@ OPENAI_API_KEY=sk-xxx ./claudebox.sh --proxy-only --proxy-service openai --shell
 --seccomp              Enable seccomp filter blocking dangerous syscalls (ptrace, mount, etc.)
 --profile NAME         Load options from ~/.config/claudebox/profiles/NAME.conf.
 --image DIR            Use extracted container rootfs as base filesystem instead of host /usr.
+--external-proxy HOST:PORT  Use a preexisting credential proxy at HOST:PORT.
+                       Requires --external-proxy-token and --share-network (sandbox mode).
+--external-proxy-token TOKEN  Dummy token from the external proxy's startup output.
 --proxy-only           Proxy-only mode: no bwrap sandbox or cgroups. Runs the credential
                        proxy and launches the command directly. Provides credential
                        protection without full isolation (sync mode for project data).
@@ -248,6 +252,74 @@ OPENAI_API_KEY=sk-xxx ./claudebox.sh --proxy-only --proxy-service openai --shell
 Project data is accessed directly (sync mode): the working directory is used as-is,
 and session data is synced back on exit when `--share-sessions` is used. `--snapshot`
 mode is also supported for proxy-only (creates a staging copy, merges back on exit).
+
+## External Credential Proxy
+
+Use `--external-proxy` to connect to a credential proxy that is already running on
+another host (or started separately via `run-credential-proxy.sh`). This skips
+starting the local `credential-proxy.js` and instead points all API traffic to the
+preexisting proxy.
+
+This is useful for:
+- Multi-sandbox setups sharing a single credential proxy
+- Running the proxy on a different machine from the sandbox
+- Separating proxy lifecycle from sandbox lifecycle
+
+### Starting the standalone proxy
+
+```bash
+# On the proxy host (e.g. 192.168.1.10):
+./run-credential-proxy.sh
+
+# Output:
+# ============================================================
+#   Credential Proxy — Connection Settings
+# ============================================================
+#   Hostname : myhost
+#
+#   # Anthropic (copy-paste into your shell):
+#   export ANTHROPIC_BASE_URL=http://myhost:58080
+#   export ANTHROPIC_API_KEY=sk-ant-oat01-xxxxxx...
+# ============================================================
+```
+
+### Connecting from claudebox
+
+Copy the hostname, port, and dummy token from the proxy output:
+
+```bash
+# Proxy-only mode (no sandbox)
+./claudebox.sh --proxy-only \
+  --external-proxy 192.168.1.10:58080 \
+  --external-proxy-token "sk-ant-oat01-xxxxxx..."
+
+# Sandbox mode (requires --share-network since Unix socket bridges
+# cannot reach a remote host)
+./claudebox.sh --share-network \
+  --external-proxy 192.168.1.10:58080 \
+  --external-proxy-token "sk-ant-oat01-xxxxxx..." \
+  --workdir ~/projects/myapp
+
+# Same host, separate process
+./claudebox.sh --proxy-only \
+  --external-proxy 127.0.0.1:58080 \
+  --external-proxy-token "sk-ant-oat01-xxxxxx..."
+```
+
+**Options:**
+
+| Option | Description |
+|---|---|
+| `--external-proxy HOST:PORT` | Connect to preexisting proxy at HOST:PORT |
+| `--external-proxy-token TOKEN` | Dummy token from the proxy's startup output (required) |
+
+**Constraints:**
+- `--external-proxy-token` (or `--dummy-credentials`) is required — the token must match
+  what the external proxy expects, otherwise requests are rejected
+- In sandbox mode, `--share-network` or `--proxy-only` is required (network-isolated
+  sandboxes use Unix socket bridges that cannot reach a remote proxy)
+- Incompatible with `--enable-github-mcp` and `--allowlist-url` (these require the
+  local credential proxy)
 
 ## Network Isolation
 
