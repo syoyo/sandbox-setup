@@ -110,6 +110,10 @@ SHARE_AMD=false        # share AMD GPU: ROCm + Vulkan (implies --share-rocm)
 SHARE_NVIDIA=false     # share NVIDIA GPU devices (/dev/nvidia*) into the sandbox
 NVIDIA_DEVICES=""      # comma-separated GPU indices to expose (empty = all)
 PROXY_ONLY=false       # proxy-only mode: no bwrap/cgroups, just credential proxy + env
+USE_EXTERNAL_PROXY=false  # use a preexisting credential proxy on another host
+EXTERNAL_PROXY_HOST=""    # hostname of the external credential proxy
+EXTERNAL_PROXY_PORT=""    # port of the external credential proxy
+EXTERNAL_PROXY_TOKEN=""   # dummy token of the external credential proxy
 PROXY_SERVICES=()      # additional services to proxy (e.g. "openai")
 PROXY_COMMAND=""       # shell command to execute in proxy-only mode
 PORT_OPENAI=58083      # in-sandbox TCP port for OpenAI proxy
@@ -249,6 +253,20 @@ while [[ $# -gt 0 ]]; do
       [[ -n "${2:-}" && "$2" =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo "❌ --nvidia-devices: expected comma-separated GPU indices (e.g. 0,1,3)"; exit 1; }
       SHARE_NVIDIA=true; NVIDIA_DEVICES=$2; shift 2 ;;
     --proxy-only)       PROXY_ONLY=true; shift ;;
+    --external-proxy)
+      # Use a preexisting credential proxy on HOST:PORT (skip starting local proxy)
+      [[ -n "${2:-}" ]] || { echo "❌ --external-proxy requires HOST:PORT argument"; exit 1; }
+      if [[ "$2" =~ ^([^:]+):([0-9]+)$ ]]; then
+        EXTERNAL_PROXY_HOST="${BASH_REMATCH[1]}"
+        EXTERNAL_PROXY_PORT="${BASH_REMATCH[2]}"
+        (( EXTERNAL_PROXY_PORT >= 1 && EXTERNAL_PROXY_PORT <= 65535 )) || { echo "❌ --external-proxy: invalid port '$EXTERNAL_PROXY_PORT' (1-65535)"; exit 1; }
+      else
+        echo "❌ --external-proxy: expected HOST:PORT format (e.g. 192.168.1.10:58080)"; exit 1
+      fi
+      USE_EXTERNAL_PROXY=true; shift 2 ;;
+    --external-proxy-token)
+      [[ -n "${2:-}" ]] || { echo "❌ --external-proxy-token requires a token argument"; exit 1; }
+      EXTERNAL_PROXY_TOKEN="$2"; shift 2 ;;
     --proxy-command)
       # SEC: reject null bytes and control characters (except common whitespace: tab, newline, CR)
       if [[ "$2" =~ [$'\x00'-$'\x08'$'\x0e'-$'\x1f'$'\x7f'] ]]; then
@@ -356,6 +374,15 @@ OPTIONS:
   --nvidia-devices LIST  Comma-separated GPU indices to expose (e.g. 0,2,3).
                          Implies --share-nvidia. Only the listed /dev/nvidiaN devices
                          are bind-mounted; also sets CUDA_VISIBLE_DEVICES inside sandbox.
+  --external-proxy HOST:PORT  Use a preexisting credential proxy running on HOST:PORT.
+                         Skips starting the local credential-proxy.js. The proxy must already
+                         be running and accessible from this host. Requires --share-network
+                         in sandbox mode (since Unix socket bridges cannot reach a remote proxy).
+                         Use --external-proxy-token to pass the dummy token printed by the
+                         external proxy (from its "Connection Settings" output).
+  --external-proxy-token TOKEN  Dummy token of the external credential proxy. Required with
+                         --external-proxy so requests are accepted by the proxy. Copy from
+                         the ANTHROPIC_API_KEY line in the proxy's startup output.
   --proxy-only           Proxy-only mode: no bwrap sandbox or cgroups. Runs the credential
                          proxy and launches the command directly with env vars pointing to
                          the proxy. Provides credential protection without full isolation.
@@ -425,6 +452,30 @@ if [[ "$LAUNCHER" == "codex" ]]; then
   if [[ "$_has_openai_proxy" != true ]]; then
     PROXY_SERVICES+=("openai")
     echo "✔ Added --proxy-service openai for codex launcher"
+  fi
+fi
+
+# Validate --external-proxy constraints
+if [[ "$USE_EXTERNAL_PROXY" == true ]]; then
+  if [[ "$PROXY_ONLY" != true && "$ISOLATE_NET" == true ]]; then
+    echo "❌ --external-proxy requires --share-network or --proxy-only in sandbox mode"
+    echo "   (network-isolated sandboxes use Unix socket bridges that cannot reach a remote proxy)"
+    exit 1
+  fi
+  if [[ -z "$EXTERNAL_PROXY_TOKEN" && -z "$DUMMY_CREDS_FILE" ]]; then
+    echo "❌ --external-proxy requires --external-proxy-token TOKEN (or --dummy-credentials)"
+    echo "   Copy the dummy token from the external proxy's startup output."
+    exit 1
+  fi
+  if [[ "$ENABLE_GITHUB_MCP" == true ]]; then
+    echo "❌ --external-proxy is incompatible with --enable-github-mcp"
+    echo "   (GitHub MCP server requires the local credential proxy)"
+    exit 1
+  fi
+  if [[ ${#ALLOWLIST_URLS[@]} -gt 0 ]]; then
+    echo "❌ --external-proxy is incompatible with --allowlist-url"
+    echo "   (URL allowlisting requires the local CONNECT proxy)"
+    exit 1
   fi
 fi
 
@@ -650,7 +701,14 @@ fi
 [[ "$PORT_ANTHROPIC" -ne "$PORT_MCP" && "$PORT_GITHUB_CONNECT" -ne "$PORT_MCP" ]] || {
   echo "❌ --mcp-port must differ from --anthropic-port and --github-port"; exit 1; }
 
-if [[ "$PROXY_ONLY" == true ]]; then
+if [[ "$USE_EXTERNAL_PROXY" == true ]]; then
+  # External proxy mode: use the provided host:port, skip port allocation
+  HOST_PORT_ANTHROPIC="$EXTERNAL_PROXY_PORT"
+  HOST_PORT_GITHUB_CONNECT="$PORT_GITHUB_CONNECT"
+  HOST_PORT_MCP_SERVER="$PORT_MCP"
+  HOST_PORT_OPENAI="$PORT_OPENAI"
+  HOST_PORT_CHATGPT="$PORT_CHATGPT"
+elif [[ "$PROXY_ONLY" == true ]]; then
   # Proxy-only mode: proxy listens on localhost directly
   HOST_PORT_ANTHROPIC="$PORT_ANTHROPIC"
   HOST_PORT_GITHUB_CONNECT="$PORT_GITHUB_CONNECT"
@@ -850,7 +908,9 @@ notify() {
 # ---------------------------------------------------------------------------
 [[ "$PROXY_ONLY" == true ]] || command -v bwrap >/dev/null 2>&1 || { echo "❌ bwrap not found (install bubblewrap)"; exit 1; }
 command -v node  >/dev/null 2>&1 || { echo "❌ node not found"; exit 1; }
-[[ -f "$PROXY_SCRIPT" ]] || { echo "❌ credential-proxy.js not found at $PROXY_SCRIPT"; exit 1; }
+if [[ "$USE_EXTERNAL_PROXY" != true ]]; then
+  [[ -f "$PROXY_SCRIPT" ]] || { echo "❌ credential-proxy.js not found at $PROXY_SCRIPT"; exit 1; }
+fi
 
 # ---------------------------------------------------------------------------
 # Locate binaries — only needed when --bind-binaries is set
@@ -913,8 +973,14 @@ else
   TEMP_CREDS=$(mktemp "$_CREDS_DIR/claude-dummy-creds-XXXXXX.json")
   # HIGH-4: generate a per-session random dummy token so attackers who know the
   # source code cannot forge proxy requests without stealing the session token.
-  SESSION_DUMMY_TOKEN=$(head -c 48 /dev/urandom | base64 | tr -d '/+=' | head -c 64)
-  SESSION_DUMMY_TOKEN="sk-ant-oat01-${SESSION_DUMMY_TOKEN}"
+  # When using --external-proxy-token, use that token instead so requests are
+  # accepted by the external proxy.
+  if [[ -n "$EXTERNAL_PROXY_TOKEN" ]]; then
+    SESSION_DUMMY_TOKEN="$EXTERNAL_PROXY_TOKEN"
+  else
+    SESSION_DUMMY_TOKEN=$(head -c 48 /dev/urandom | base64 | tr -d '/+=' | head -c 64)
+    SESSION_DUMMY_TOKEN="sk-ant-oat01-${SESSION_DUMMY_TOKEN}"
+  fi
   export SESSION_DUMMY_TOKEN  # used by proxy via environment
 
   node - "$TEMP_CREDS" <<'NODEEOF'
@@ -955,113 +1021,131 @@ printf '[core]\n\thooksPath = /dev/null\n' > "$SANDBOX_GITCONFIG"
 chmod 444 "$SANDBOX_GITCONFIG"
 
 # ---------------------------------------------------------------------------
-# Start credential proxy on the host
+# Start credential proxy on the host (or use external proxy)
 # ---------------------------------------------------------------------------
-echo "▶ Starting credential proxy"
-PROXY_ARGS=(
-  --anthropic-socket "$SOCKET_ANTHROPIC"
-  # CONNECT proxy: Unix socket for bind-mounting into sandbox.
-  --github-socket "$SOCKET_GITHUB"
-  --anthropic-tcp-port "$HOST_PORT_ANTHROPIC"
-  --github-connect-port "$HOST_PORT_GITHUB_CONNECT"
-)
-[[ "$ENABLE_GITHUB" == true ]] && PROXY_ARGS+=(--enable-github)
-if [[ "$AUTO_REFRESH_AUTH" == true ]]; then
-  PROXY_ARGS+=(--auto-refresh-auth)
-else
-  PROXY_ARGS+=(--no-auto-refresh-auth)
-fi
-for _url in "${ALLOWLIST_URLS[@]+"${ALLOWLIST_URLS[@]}"}"; do
-  PROXY_ARGS+=(--connect-allowlist "$_url")
-done
-[[ -n "$TOKEN_LIMIT" ]] && PROXY_ARGS+=(--token-limit "$TOKEN_LIMIT")
-[[ -n "$AUDIT_LOG" ]] && PROXY_ARGS+=(--audit-log "$AUDIT_LOG")
 
-# GitHub MCP server: start on host, add reverse bridge args to proxy
-if [[ "$ENABLE_GITHUB_MCP" == true ]]; then
-  [[ -n "${GH_TOKEN:-}" ]] || { echo "❌ --enable-github-mcp requires GH_TOKEN to be set on the host"; exit 1; }
-  command -v github-mcp-server >/dev/null 2>&1 || { echo "❌ github-mcp-server not found (install from https://github.com/github/github-mcp-server)"; exit 1; }
-  echo "▶ Starting GitHub MCP server (HTTP mode, host port $HOST_PORT_MCP_SERVER)"
-  GITHUB_PERSONAL_ACCESS_TOKEN="$GH_TOKEN" github-mcp-server http --port "$HOST_PORT_MCP_SERVER" &
-  MCP_SERVER_PID=$!
-  # Wait for MCP server to be ready
-  for _i in $(seq 1 30); do
-    (echo >/dev/tcp/127.0.0.1/"$HOST_PORT_MCP_SERVER") 2>/dev/null && break || true
-    sleep 0.2
-    kill -0 "$MCP_SERVER_PID" 2>/dev/null || { echo "❌ GitHub MCP server died"; exit 1; }
-  done
-  (echo >/dev/tcp/127.0.0.1/"$HOST_PORT_MCP_SERVER") 2>/dev/null || { echo "❌ GitHub MCP server did not start"; exit 1; }
-  echo "✔ GitHub MCP server ready (host port $HOST_PORT_MCP_SERVER)"
-  # HIGH-3: pass bearer token via env var, not CLI arg (avoids /proc/PID/cmdline leak).
-  export MCP_BEARER_TOKEN="$GH_TOKEN"
-  PROXY_ARGS+=(--mcp-bridge-socket "$SOCKET_MCP" --mcp-bridge-port "$HOST_PORT_MCP_SERVER")
-fi
-[[ "$IDLE_TIMEOUT" -gt 0 ]] && PROXY_ARGS+=(--idle-timeout "$IDLE_TIMEOUT")
-[[ -n "$NOTIFY_COMMAND" ]] && PROXY_ARGS+=(--notify-command "$NOTIFY_COMMAND")
-[[ -n "$NOTIFY_WEBHOOK" ]] && PROXY_ARGS+=(--notify-webhook "$NOTIFY_WEBHOOK")
-# HIGH-3: pass webhook URL via env var (not CLI arg) to avoid /proc/PID/cmdline leak.
-if [[ -n "$SLACK_WEBHOOK" ]]; then
-  export SLACK_WEBHOOK_URL="$SLACK_WEBHOOK"
-  PROXY_ARGS+=(--slack-socket "$SOCKET_SLACK")
-fi
-
-# Additional LLM service proxies (--proxy-service openai, etc.)
+# Track which additional services are enabled (needed by both paths)
 _HAS_OPENAI=false
 _HAS_CHATGPT=false
 for _svc in "${PROXY_SERVICES[@]+"${PROXY_SERVICES[@]}"}"; do
-  PROXY_ARGS+=(--service "$_svc")
   case "$_svc" in
-    openai)
-      _HAS_OPENAI=true
-      # Save real OpenAI key for the proxy before we swap it with a dummy
-      if [[ -n "${OPENAI_API_KEY:-}" ]]; then
-        export _REAL_OPENAI_API_KEY="$OPENAI_API_KEY"
-      fi
-      PROXY_ARGS+=(--service-socket "openai:$SOCKET_OPENAI")
-      PROXY_ARGS+=(--service-port "openai:$HOST_PORT_OPENAI")
-      ;;
-    chatgpt)
-      _HAS_CHATGPT=true
-      PROXY_ARGS+=(--service-socket "chatgpt:$SOCKET_CHATGPT")
-      PROXY_ARGS+=(--service-port "chatgpt:$HOST_PORT_CHATGPT")
-      ;;
+    openai)  _HAS_OPENAI=true ;;
+    chatgpt) _HAS_CHATGPT=true ;;
   esac
 done
 
-node "$PROXY_SCRIPT" "${PROXY_ARGS[@]}" &
-PROXY_PID=$!
+if [[ "$USE_EXTERNAL_PROXY" == true ]]; then
+  # ---------------------------------------------------------------------------
+  # External proxy mode: skip starting local credential-proxy.js
+  # ---------------------------------------------------------------------------
+  echo "▶ Using external credential proxy at $EXTERNAL_PROXY_HOST:$EXTERNAL_PROXY_PORT"
+  echo "✔ External proxy (anthropic=$EXTERNAL_PROXY_HOST:$EXTERNAL_PROXY_PORT)"
+else
+  # ---------------------------------------------------------------------------
+  # Local proxy mode: start credential-proxy.js on the host
+  # ---------------------------------------------------------------------------
+  echo "▶ Starting credential proxy"
+  PROXY_ARGS=(
+    --anthropic-socket "$SOCKET_ANTHROPIC"
+    # CONNECT proxy: Unix socket for bind-mounting into sandbox.
+    --github-socket "$SOCKET_GITHUB"
+    --anthropic-tcp-port "$HOST_PORT_ANTHROPIC"
+    --github-connect-port "$HOST_PORT_GITHUB_CONNECT"
+  )
+  [[ "$ENABLE_GITHUB" == true ]] && PROXY_ARGS+=(--enable-github)
+  if [[ "$AUTO_REFRESH_AUTH" == true ]]; then
+    PROXY_ARGS+=(--auto-refresh-auth)
+  else
+    PROXY_ARGS+=(--no-auto-refresh-auth)
+  fi
+  for _url in "${ALLOWLIST_URLS[@]+"${ALLOWLIST_URLS[@]}"}"; do
+    PROXY_ARGS+=(--connect-allowlist "$_url")
+  done
+  [[ -n "$TOKEN_LIMIT" ]] && PROXY_ARGS+=(--token-limit "$TOKEN_LIMIT")
+  [[ -n "$AUDIT_LOG" ]] && PROXY_ARGS+=(--audit-log "$AUDIT_LOG")
 
-_wait_sockets() {
-  [[ -S "$SOCKET_ANTHROPIC" ]] || return 1
-  [[ -S "$SOCKET_GITHUB" ]] || return 1
-  [[ "$ENABLE_GITHUB_MCP" == true ]] && { [[ -S "$SOCKET_MCP" ]] || return 1; }
-  [[ "$_HAS_OPENAI" == true ]] && { [[ -S "$SOCKET_OPENAI" ]] || return 1; }
-  [[ "$_HAS_CHATGPT" == true ]] && { [[ -S "$SOCKET_CHATGPT" ]] || return 1; }
-  [[ -n "$SLACK_WEBHOOK" ]] && { [[ -S "$SOCKET_SLACK" ]] || return 1; }
-  return 0
-}
-for _i in $(seq 1 25); do
-  _wait_sockets && break
-  sleep 0.2
-  kill -0 "$PROXY_PID" 2>/dev/null || { echo "❌ Proxy process died"; exit 1; }
-done
-[[ -S "$SOCKET_ANTHROPIC" ]] || { echo "❌ Anthropic proxy socket did not appear"; exit 1; }
-[[ -S "$SOCKET_GITHUB" ]]    || { echo "❌ GitHub proxy socket did not appear"; exit 1; }
-[[ "$ENABLE_GITHUB_MCP" == true ]] && { [[ -S "$SOCKET_MCP" ]] || { echo "❌ MCP bridge socket did not appear"; exit 1; }; }
-[[ "$_HAS_OPENAI" == true ]] && { [[ -S "$SOCKET_OPENAI" ]] || { echo "❌ OpenAI proxy socket did not appear"; exit 1; }; }
-[[ "$_HAS_CHATGPT" == true ]] && { [[ -S "$SOCKET_CHATGPT" ]] || { echo "❌ ChatGPT proxy socket did not appear"; exit 1; }; }
-[[ -n "$SLACK_WEBHOOK" ]] && { [[ -S "$SOCKET_SLACK" ]] || { echo "❌ Slack proxy socket did not appear"; exit 1; }; }
-_gh_desc="none"; [[ "$ENABLE_GITHUB" == true ]] && _gh_desc="api.github.com"
-[[ "$ENABLE_GITHUB_MCP" == true ]] && _gh_desc="${_gh_desc}+mcp"
-if [[ ${#ALLOWLIST_URLS[@]} -gt 0 ]]; then
-  _extra="${ALLOWLIST_URLS[*]}"
-  [[ "$_gh_desc" == "none" ]] && _gh_desc="$_extra" || _gh_desc="${_gh_desc},${_extra}"
+  # GitHub MCP server: start on host, add reverse bridge args to proxy
+  if [[ "$ENABLE_GITHUB_MCP" == true ]]; then
+    [[ -n "${GH_TOKEN:-}" ]] || { echo "❌ --enable-github-mcp requires GH_TOKEN to be set on the host"; exit 1; }
+    command -v github-mcp-server >/dev/null 2>&1 || { echo "❌ github-mcp-server not found (install from https://github.com/github/github-mcp-server)"; exit 1; }
+    echo "▶ Starting GitHub MCP server (HTTP mode, host port $HOST_PORT_MCP_SERVER)"
+    GITHUB_PERSONAL_ACCESS_TOKEN="$GH_TOKEN" github-mcp-server http --port "$HOST_PORT_MCP_SERVER" &
+    MCP_SERVER_PID=$!
+    # Wait for MCP server to be ready
+    for _i in $(seq 1 30); do
+      (echo >/dev/tcp/127.0.0.1/"$HOST_PORT_MCP_SERVER") 2>/dev/null && break || true
+      sleep 0.2
+      kill -0 "$MCP_SERVER_PID" 2>/dev/null || { echo "❌ GitHub MCP server died"; exit 1; }
+    done
+    (echo >/dev/tcp/127.0.0.1/"$HOST_PORT_MCP_SERVER") 2>/dev/null || { echo "❌ GitHub MCP server did not start"; exit 1; }
+    echo "✔ GitHub MCP server ready (host port $HOST_PORT_MCP_SERVER)"
+    # HIGH-3: pass bearer token via env var, not CLI arg (avoids /proc/PID/cmdline leak).
+    export MCP_BEARER_TOKEN="$GH_TOKEN"
+    PROXY_ARGS+=(--mcp-bridge-socket "$SOCKET_MCP" --mcp-bridge-port "$HOST_PORT_MCP_SERVER")
+  fi
+  [[ "$IDLE_TIMEOUT" -gt 0 ]] && PROXY_ARGS+=(--idle-timeout "$IDLE_TIMEOUT")
+  [[ -n "$NOTIFY_COMMAND" ]] && PROXY_ARGS+=(--notify-command "$NOTIFY_COMMAND")
+  [[ -n "$NOTIFY_WEBHOOK" ]] && PROXY_ARGS+=(--notify-webhook "$NOTIFY_WEBHOOK")
+  # HIGH-3: pass webhook URL via env var (not CLI arg) to avoid /proc/PID/cmdline leak.
+  if [[ -n "$SLACK_WEBHOOK" ]]; then
+    export SLACK_WEBHOOK_URL="$SLACK_WEBHOOK"
+    PROXY_ARGS+=(--slack-socket "$SOCKET_SLACK")
+  fi
+
+  # Additional LLM service proxies (--proxy-service openai, etc.)
+  for _svc in "${PROXY_SERVICES[@]+"${PROXY_SERVICES[@]}"}"; do
+    PROXY_ARGS+=(--service "$_svc")
+    case "$_svc" in
+      openai)
+        # Save real OpenAI key for the proxy before we swap it with a dummy
+        if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+          export _REAL_OPENAI_API_KEY="$OPENAI_API_KEY"
+        fi
+        PROXY_ARGS+=(--service-socket "openai:$SOCKET_OPENAI")
+        PROXY_ARGS+=(--service-port "openai:$HOST_PORT_OPENAI")
+        ;;
+      chatgpt)
+        PROXY_ARGS+=(--service-socket "chatgpt:$SOCKET_CHATGPT")
+        PROXY_ARGS+=(--service-port "chatgpt:$HOST_PORT_CHATGPT")
+        ;;
+    esac
+  done
+
+  node "$PROXY_SCRIPT" "${PROXY_ARGS[@]}" &
+  PROXY_PID=$!
+
+  _wait_sockets() {
+    [[ -S "$SOCKET_ANTHROPIC" ]] || return 1
+    [[ -S "$SOCKET_GITHUB" ]] || return 1
+    [[ "$ENABLE_GITHUB_MCP" == true ]] && { [[ -S "$SOCKET_MCP" ]] || return 1; }
+    [[ "$_HAS_OPENAI" == true ]] && { [[ -S "$SOCKET_OPENAI" ]] || return 1; }
+    [[ "$_HAS_CHATGPT" == true ]] && { [[ -S "$SOCKET_CHATGPT" ]] || return 1; }
+    [[ -n "$SLACK_WEBHOOK" ]] && { [[ -S "$SOCKET_SLACK" ]] || return 1; }
+    return 0
+  }
+  for _i in $(seq 1 25); do
+    _wait_sockets && break
+    sleep 0.2
+    kill -0 "$PROXY_PID" 2>/dev/null || { echo "❌ Proxy process died"; exit 1; }
+  done
+  [[ -S "$SOCKET_ANTHROPIC" ]] || { echo "❌ Anthropic proxy socket did not appear"; exit 1; }
+  [[ -S "$SOCKET_GITHUB" ]]    || { echo "❌ GitHub proxy socket did not appear"; exit 1; }
+  [[ "$ENABLE_GITHUB_MCP" == true ]] && { [[ -S "$SOCKET_MCP" ]] || { echo "❌ MCP bridge socket did not appear"; exit 1; }; }
+  [[ "$_HAS_OPENAI" == true ]] && { [[ -S "$SOCKET_OPENAI" ]] || { echo "❌ OpenAI proxy socket did not appear"; exit 1; }; }
+  [[ "$_HAS_CHATGPT" == true ]] && { [[ -S "$SOCKET_CHATGPT" ]] || { echo "❌ ChatGPT proxy socket did not appear"; exit 1; }; }
+  [[ -n "$SLACK_WEBHOOK" ]] && { [[ -S "$SOCKET_SLACK" ]] || { echo "❌ Slack proxy socket did not appear"; exit 1; }; }
+  _gh_desc="none"; [[ "$ENABLE_GITHUB" == true ]] && _gh_desc="api.github.com"
+  [[ "$ENABLE_GITHUB_MCP" == true ]] && _gh_desc="${_gh_desc}+mcp"
+  if [[ ${#ALLOWLIST_URLS[@]} -gt 0 ]]; then
+    _extra="${ALLOWLIST_URLS[*]}"
+    [[ "$_gh_desc" == "none" ]] && _gh_desc="$_extra" || _gh_desc="${_gh_desc},${_extra}"
+  fi
+  _svc_desc=""
+  [[ "$_HAS_OPENAI" == true ]] && _svc_desc=", openai=$SOCKET_OPENAI"
+  [[ "$_HAS_CHATGPT" == true ]] && _svc_desc+=", chatgpt=$SOCKET_CHATGPT"
+  _slack_desc=""; [[ -n "$SLACK_WEBHOOK" ]] && _slack_desc=", slack=proxy"
+  echo "✔ Proxy ready (anthropic=$SOCKET_ANTHROPIC, github=$SOCKET_GITHUB, allowlist=$_gh_desc${_svc_desc}${_slack_desc})"
 fi
-_svc_desc=""
-[[ "$_HAS_OPENAI" == true ]] && _svc_desc=", openai=$SOCKET_OPENAI"
-[[ "$_HAS_CHATGPT" == true ]] && _svc_desc+=", chatgpt=$SOCKET_CHATGPT"
-_slack_desc=""; [[ -n "$SLACK_WEBHOOK" ]] && _slack_desc=", slack=proxy"
-echo "✔ Proxy ready (anthropic=$SOCKET_ANTHROPIC, github=$SOCKET_GITHUB, allowlist=$_gh_desc${_svc_desc}${_slack_desc})"
 
 # ---------------------------------------------------------------------------
 # Diff-on-exit: show git diff --stat if workdir is a git repo
@@ -1289,32 +1373,36 @@ if [[ "$PROXY_ONLY" == true ]]; then
   fi
 
   # Build environment for the proxied command
+  # Use external proxy hostname if set, otherwise localhost
+  _PROXY_CONNECT_HOST="127.0.0.1"
+  [[ "$USE_EXTERNAL_PROXY" == true ]] && _PROXY_CONNECT_HOST="$EXTERNAL_PROXY_HOST"
+
   _PROXY_ENV=(
-    ANTHROPIC_BASE_URL="http://127.0.0.1:$HOST_PORT_ANTHROPIC"
+    ANTHROPIC_BASE_URL="http://$_PROXY_CONNECT_HOST:$HOST_PORT_ANTHROPIC"
     CLAUDE_CONFIG_DIR="$_PROXY_ONLY_CLAUDE_DIR"
     CODEX_HOME="$_PROXY_ONLY_CODEX_HOME"
     SESSION_DUMMY_TOKEN="$SESSION_DUMMY_TOKEN"
-    NO_PROXY="127.0.0.1,localhost,::1"
+    NO_PROXY="127.0.0.1,localhost,::1${EXTERNAL_PROXY_HOST:+,$EXTERNAL_PROXY_HOST}"
     HTTP_PROXY=""
     ALL_PROXY=""
   )
 
   # GitHub CONNECT proxy for additional HTTPS hosts
   if [[ "$ENABLE_GITHUB" == true || ${#ALLOWLIST_URLS[@]} -gt 0 ]]; then
-    _PROXY_ENV+=(HTTPS_PROXY="http://127.0.0.1:$HOST_PORT_GITHUB_CONNECT")
+    _PROXY_ENV+=(HTTPS_PROXY="http://$_PROXY_CONNECT_HOST:$HOST_PORT_GITHUB_CONNECT")
   fi
 
   # OpenAI service proxy
   if [[ "$_HAS_OPENAI" == true ]]; then
     _PROXY_ENV+=(
-      OPENAI_BASE_URL="http://127.0.0.1:$HOST_PORT_OPENAI"
-      OPENAI_BASE_URI="http://127.0.0.1:$HOST_PORT_OPENAI"
+      OPENAI_BASE_URL="http://$_PROXY_CONNECT_HOST:$HOST_PORT_OPENAI"
+      OPENAI_BASE_URI="http://$_PROXY_CONNECT_HOST:$HOST_PORT_OPENAI"
       OPENAI_API_KEY="$SESSION_DUMMY_TOKEN"
     )
-    echo "  OpenAI proxy: http://127.0.0.1:$HOST_PORT_OPENAI"
+    echo "  OpenAI proxy: http://$_PROXY_CONNECT_HOST:$HOST_PORT_OPENAI"
   fi
   if [[ "$_HAS_CHATGPT" == true ]]; then
-    echo "  ChatGPT proxy: http://127.0.0.1:$HOST_PORT_CHATGPT/backend-api"
+    echo "  ChatGPT proxy: http://$_PROXY_CONNECT_HOST:$HOST_PORT_CHATGPT/backend-api"
   fi
 
   # GitHub MCP: write settings.local.json with MCP config
@@ -1324,7 +1412,7 @@ if [[ "$PROXY_ONLY" == true ]]; then
   "mcpServers": {
     "github": {
       "type": "url",
-      "url": "http://127.0.0.1:${HOST_PORT_MCP_SERVER}/mcp",
+      "url": "http://$_PROXY_CONNECT_HOST:${HOST_PORT_MCP_SERVER}/mcp",
       "headers": {
         "Authorization": "Bearer ${SESSION_DUMMY_TOKEN}"
       }
@@ -1332,7 +1420,7 @@ if [[ "$PROXY_ONLY" == true ]]; then
   }
 }
 MCPEOF
-    echo "  GitHub MCP: http://127.0.0.1:$HOST_PORT_MCP_SERVER"
+    echo "  GitHub MCP: http://$_PROXY_CONNECT_HOST:$HOST_PORT_MCP_SERVER"
   fi
 
   NET_DESC="host network (proxy-only)"
@@ -1340,7 +1428,7 @@ MCPEOF
   elif [[ "$READONLY_WORKDIR" == true ]]; then _rw_desc="read-only"
   else _rw_desc="read-write"; fi
   echo "  Workdir: $WORKDIR [$_rw_desc]"
-  echo "  Anthropic proxy: http://127.0.0.1:$HOST_PORT_ANTHROPIC"
+  echo "  Anthropic proxy: http://$_PROXY_CONNECT_HOST:$HOST_PORT_ANTHROPIC"
   echo "  Config dir: $_PROXY_ONLY_CLAUDE_DIR"
   [[ "$LAUNCHER" == "codex" ]] && echo "  Codex home: $_PROXY_ONLY_CODEX_HOME"
   notify sandbox_start ":rocket: Proxy-only started — workdir: \`$(basename "$WORKDIR")\` [$_rw_desc], PID: $$"
@@ -1506,6 +1594,15 @@ else
   done
 fi
 
+# Determine Anthropic proxy address for sandbox env vars
+if [[ "$USE_EXTERNAL_PROXY" == true ]]; then
+  _SANDBOX_ANTHROPIC_HOST="$EXTERNAL_PROXY_HOST"
+  _SANDBOX_ANTHROPIC_PORT="$EXTERNAL_PROXY_PORT"
+else
+  _SANDBOX_ANTHROPIC_HOST="127.0.0.1"
+  _SANDBOX_ANTHROPIC_PORT="$PORT_ANTHROPIC"
+fi
+
 BWRAP=(
   bwrap
 
@@ -1540,14 +1637,6 @@ BWRAP=(
 
   # ---- Workdir (added conditionally after array) ----
 
-  # ---- Proxy sockets ----
-  --ro-bind "$SOCKET_ANTHROPIC" "$SANDBOX_SOCKET_ANTHROPIC"
-  --ro-bind "$SOCKET_GITHUB"    "$SANDBOX_SOCKET_GITHUB"
-
-  # MED-3: bind credential-proxy.js from SCRIPT_DIR (read-only) so the in-sandbox
-  # bridge cannot be replaced by a tampered copy in the writable workspace.
-  --ro-bind "$PROXY_SCRIPT" /run/credential-proxy.js
-
   # ---- Attach socket directory (rw — socat creates the socket here) ----
   --bind "$ATTACH_DIR" /run/attach
 
@@ -1559,11 +1648,11 @@ BWRAP=(
   --setenv SHELL   /bin/bash
   --setenv TERM    xterm-256color
   --setenv PATH    "$SANDBOX_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
-  --setenv ANTHROPIC_BASE_URL "http://127.0.0.1:$PORT_ANTHROPIC"
+  --setenv ANTHROPIC_BASE_URL "http://$_SANDBOX_ANTHROPIC_HOST:$_SANDBOX_ANTHROPIC_PORT"
   # 127.0.0.1 is in NO_PROXY so the Anthropic bridge is reached directly.
   --setenv HTTP_PROXY  ""
   --setenv ALL_PROXY   ""
-  --setenv NO_PROXY    "127.0.0.1,localhost,::1"
+  --setenv NO_PROXY    "127.0.0.1,localhost,::1${EXTERNAL_PROXY_HOST:+,$EXTERNAL_PROXY_HOST}"
   --setenv CODEX_HOME  "$SANDBOX_HOME/.codex"
   # MED-6: disable git hooks via read-only system gitconfig to prevent
   # network isolation bypass.  Env vars (GIT_CONFIG_COUNT) are bypassable
@@ -1584,6 +1673,17 @@ BWRAP=(
 
   --chdir "$SANDBOX_WORKDIR"
 )
+
+# ---- Proxy sockets (local proxy only; skipped for --external-proxy) ----
+if [[ "$USE_EXTERNAL_PROXY" != true ]]; then
+  BWRAP+=(
+    --ro-bind "$SOCKET_ANTHROPIC" "$SANDBOX_SOCKET_ANTHROPIC"
+    --ro-bind "$SOCKET_GITHUB"    "$SANDBOX_SOCKET_GITHUB"
+    # MED-3: bind credential-proxy.js from SCRIPT_DIR (read-only) so the in-sandbox
+    # bridge cannot be replaced by a tampered copy in the writable workspace.
+    --ro-bind "$PROXY_SCRIPT" /run/credential-proxy.js
+  )
+fi
 
 # Home directory: cache-home uses persistent bind mount; default uses tmpfs
 if [[ -n "$CACHE_HOME" ]]; then
