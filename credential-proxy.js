@@ -1821,7 +1821,7 @@ function startGenericServiceProxy(presetName, socketPath, tcpPort, dummyToken, v
   }
   console.log(`${tag} Path allowlist: ${preset.pathAllowlist.toString()}`);
 
-  return { server, socketPath, tcpPort };
+  return { server, socketPath, tcpPort, name: presetName };
 }
 
 // ---------------------------------------------------------------------------
@@ -2116,4 +2116,32 @@ if (args.bridgeOnly) {
     const result = startGenericServiceProxy(svcName, svcSocket, svcPort, DUMMY_CLAUDE_TOKEN, args.verbose);
     _serviceProxies.push(result);
   }
+
+  // -------------------------------------------------------------------------
+  // Print connection summary: hostname + port for easy copy-paste
+  // -------------------------------------------------------------------------
+  const hostname = os.hostname();
+  console.log('');
+  console.log('='.repeat(60));
+  console.log('  Credential Proxy — Connection Settings');
+  console.log('='.repeat(60));
+  console.log(`  Hostname : ${hostname}`);
+  console.log('');
+  console.log('  # Anthropic (copy-paste into your shell):');
+  console.log(`  export ANTHROPIC_BASE_URL=http://${hostname}:${tcpPort}`);
+  console.log(`  export ANTHROPIC_API_KEY=${DUMMY_CLAUDE_TOKEN}`);
+  for (const svc of _serviceProxies) {
+    const svcUpper = svc.name.toUpperCase();
+    console.log('');
+    console.log(`  # ${svc.name} (copy-paste into your shell):`);
+    console.log(`  export ${svcUpper}_BASE_URL=http://${hostname}:${svc.tcpPort}`);
+    console.log(`  export ${svcUpper}_API_KEY=${DUMMY_CLAUDE_TOKEN}`);
+  }
+  if (args.githubConnectPort) {
+    console.log('');
+    console.log('  # GitHub CONNECT proxy:');
+    console.log(`  export HTTPS_PROXY=http://${hostname}:${args.githubConnectPort}`);
+  }
+  console.log('='.repeat(60));
+  console.log('');
 }
